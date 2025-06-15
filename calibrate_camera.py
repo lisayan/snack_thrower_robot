@@ -304,7 +304,15 @@ class LeRobotHardwareWithVision:
             pil_img = image
         
         # Task-specific prompts
-        if self.robot_type == "koch":
+        if self.robot_type in ["so100", "so101"]:
+            prompt = """Analyze this robot workspace. I have an SO-101 robot arm.
+            Identify:
+            1. Any graspable objects (blocks, cups, toys)
+            2. Target locations (plates, containers, goals)
+            3. The robot gripper position
+            4. Suggested action: 'move_to: x,y', 'grasp', 'release', or 'home'
+            Return coordinates and action."""
+        elif self.robot_type == "koch":
             prompt = """Analyze this robot workspace. I have a Koch robot arm.
             Identify:
             1. Any graspable objects (blocks, cups, toys)
@@ -660,7 +668,7 @@ def main():
     print("Available robots:", ["koch", "so100", "so101"])
     
     # Get robot type
-    robot_type = input("Enter robot type [koch]: ").strip() or "koch"
+    robot_type = input("Enter robot type [so101]: ").strip() or "so101"
     
     # Check if teleoperation is desired
     use_teleop = input("Enable teleoperation? (y/n) [n]: ").strip().lower() == 'y'
