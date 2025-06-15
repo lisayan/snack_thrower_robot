@@ -1,14 +1,7 @@
-(base) jakehennessy@MacBookAir robot-hack % cat intergrated_pick.py
 #!/usr/bin/env python3
 """
 Real LeRobot Hardware Integration with SmolVLM for vision-based control
 Works with actual LeRobot hardware (Koch, ALOHA, SO100, SO101, etc.)
-
-Requirements:
-- pip install lerobot
-- pip install transformers
-- pip install opencv-python pillow
-- Hardware: LeRobot-compatible robot (Koch, ALOHA, SO100, etc.)
 """
 
 import numpy as np
@@ -55,6 +48,287 @@ except ImportError:
         print("Using VisionEncoderDecoderModel as fallback")
 
 print("Loading LeRobot Hardware Interface with SmolVLM...")
+
+@dataclass
+class PickPlaceController:
+    """Controller for autonomous pick and place operations"""
+    
+    def __init__(self, robot_instance):
+        self.robot = robot_instance
+        self.pick_height = 50  # mm above table
+        self.approach_height = 150  # mm for approach
+        self.drop_location = (200, 300)  # Default drop location in mm
+        self.gripper_open_pos = 80.0
+        self.gripper_close_pos = 20.0
+        
+        # State machine
+        self.state = "SEARCHING"  # SEARCHING, APPROACHING, GRASPING, LIFTING, MOVING, DROPPING, DONE
+        self.target_object = None
+        self.last_detection_time = 0
+        
+    def detect_objects_with_depth_only(self, image, depth_frame):
+        """Detect objects using depth information when vision model is not available"""
+        detections = {
+            'objects': [],
+            'targets': [],
+            'actions': [],
+            'robot_coords': []
+        }
+        
+        if depth_frame is None:
+            return detections
+            
+        try:
+            # Threshold depth to find objects on table
+            # Assuming table is at ~500-700mm depth
+            table_depth_min = 400
+            table_depth_max = 800
+            
+            # Create mask for objects on table
+            mask = np.where((depth_frame > table_depth_min) & (depth_frame < table_depth_max), 255, 0).astype(np.uint8)
+            
+            # Remove noise
+            kernel = np.ones((5,5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter and sort contours by area
+            valid_contours = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 500:  # Minimum object size
+                    valid_contours.append(contour)
+            
+            # Sort by area (largest first)
+            valid_contours.sort(key=cv2.contourArea, reverse=True)
+            
+            # Process top 3 objects
+            for i, contour in enumerate(valid_contours[:3]):
+                # Get center of contour
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    
+                    # Get depth at center
+                    depth_at_center = depth_frame[cy, cx]
+                    
+                    # Add to detections
+                    detections['objects'].append((cx, cy))
+                    
+                    # Convert to robot coordinates if calibrated
+                    if self.robot.camera_calibration is not None:
+                        robot_x, robot_y = self.robot.pixel_to_robot(cx, cy)
+                        detections['robot_coords'].append((robot_x, robot_y, depth_at_center))
+                        
+                    # Draw on image
+                    cv2.drawContours(image, [contour], -1, (0, 255, 0), 2)
+                    cv2.circle(image, (cx, cy), 5, (255, 0, 0), -1)
+                    cv2.putText(image, f"Obj{i+1} D:{int(depth_at_center)}mm", (cx-40, cy-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            
+            # Determine action based on state
+            if self.state == "SEARCHING" and detections['objects']:
+                detections['actions'].append('move_to_object')
+            
+            return detections
+            
+        except Exception as e:
+            print(f"Depth detection error: {e}")
+            return detections
+    
+    def inverse_kinematics_so101(self, x, y, z, gripper_angle=0):
+        """
+        Simple inverse kinematics for SO101 robot
+        Returns joint angles to reach target position
+        """
+        # Robot dimensions (approximate - adjust for your robot)
+        L1 = 100  # Base to shoulder height
+        L2 = 150  # Upper arm length  
+        L3 = 150  # Forearm length
+        L4 = 100  # Wrist to gripper length
+        
+        # Calculate distance to target
+        dist_xy = np.sqrt(x**2 + y**2)
+        
+        # Shoulder pan angle
+        shoulder_pan = np.arctan2(x, y) * 180 / np.pi
+        
+        # Effective reach in z-plane
+        z_eff = z - L1
+        reach = np.sqrt(dist_xy**2 + z_eff**2)
+        
+        # Check if reachable
+        max_reach = L2 + L3 + L4
+        if reach > max_reach * 0.95:  # 95% of max reach for safety
+            print(f"Target out of reach: {reach}mm > {max_reach}mm")
+            return None
+            
+        # Calculate elbow angle using law of cosines
+        cos_elbow = (L2**2 + L3**2 - reach**2) / (2 * L2 * L3)
+        cos_elbow = np.clip(cos_elbow, -1, 1)
+        elbow_angle = np.arccos(cos_elbow) * 180 / np.pi - 180
+        
+        # Calculate shoulder lift angle
+        alpha = np.arctan2(z_eff, dist_xy) * 180 / np.pi
+        cos_beta = (L2**2 + reach**2 - L3**2) / (2 * L2 * reach)
+        cos_beta = np.clip(cos_beta, -1, 1)
+        beta = np.arccos(cos_beta) * 180 / np.pi
+        shoulder_lift = -(alpha + beta)
+        
+        # Wrist angle to keep gripper level
+        wrist_flex = -(shoulder_lift + elbow_angle + gripper_angle)
+        
+        return {
+            'shoulder_pan.pos': np.clip(shoulder_pan, -90, 90),
+            'shoulder_lift.pos': np.clip(shoulder_lift, -90, 0),
+            'elbow_flex.pos': np.clip(elbow_angle, -135, 0),
+            'wrist_flex.pos': np.clip(wrist_flex, -90, 90),
+            'wrist_roll.pos': 0.0
+        }
+    
+    def execute_pick_place(self, detections):
+        """Execute pick and place state machine"""
+        current_time = time.time()
+        
+        # Update target object
+        if detections['robot_coords'] and (self.target_object is None or self.state == "SEARCHING"):
+            # Pick closest object
+            self.target_object = min(detections['robot_coords'], key=lambda p: np.sqrt(p[0]**2 + p[1]**2))
+            self.last_detection_time = current_time
+            
+        # State machine
+        if self.state == "SEARCHING":
+            if self.target_object:
+                print(f"Found object at {self.target_object[:2]}mm")
+                self.state = "APPROACHING"
+            else:
+                # Keep searching - move to scan position
+                return {
+                    'shoulder_pan.pos': np.sin(current_time) * 30,  # Scan left-right
+                    'shoulder_lift.pos': -45.0,
+                    'elbow_flex.pos': -45.0,
+                    'wrist_flex.pos': -45.0,
+                    'wrist_roll.pos': 0.0,
+                    'gripper.pos': self.gripper_open_pos
+                }
+                
+        elif self.state == "APPROACHING":
+            if self.target_object:
+                x, y, depth = self.target_object
+                # Move above object
+                target_pos = self.inverse_kinematics_so101(x, y, self.approach_height)
+                if target_pos:
+                    target_pos['gripper.pos'] = self.gripper_open_pos
+                    print(f"Approaching object at ({x:.1f}, {y:.1f})mm")
+                    
+                    # Check if we're close to target position
+                    obs = self.robot.robot.get_observation()
+                    if self._is_at_position(obs, target_pos, tolerance=10):
+                        self.state = "GRASPING"
+                        time.sleep(0.5)  # Stabilize
+                    
+                    return target_pos
+                    
+        elif self.state == "GRASPING":
+            if self.target_object:
+                x, y, depth = self.target_object
+                # Move down to pick height
+                target_pos = self.inverse_kinematics_so101(x, y, self.pick_height)
+                if target_pos:
+                    target_pos['gripper.pos'] = self.gripper_open_pos
+                    print(f"Moving down to grasp at height {self.pick_height}mm")
+                    
+                    # Check if we're at pick position
+                    obs = self.robot.robot.get_observation()
+                    if self._is_at_position(obs, target_pos, tolerance=5):
+                        # Close gripper
+                        target_pos['gripper.pos'] = self.gripper_close_pos
+                        print("Closing gripper...")
+                        self.state = "LIFTING"
+                        time.sleep(1.0)  # Wait for gripper to close
+                        
+                    return target_pos
+                    
+        elif self.state == "LIFTING":
+            if self.target_object:
+                x, y, _ = self.target_object
+                # Lift up
+                target_pos = self.inverse_kinematics_so101(x, y, self.approach_height)
+                if target_pos:
+                    target_pos['gripper.pos'] = self.gripper_close_pos
+                    print("Lifting object...")
+                    
+                    obs = self.robot.robot.get_observation()
+                    if self._is_at_position(obs, target_pos, tolerance=10):
+                        self.state = "MOVING"
+                        time.sleep(0.5)
+                        
+                    return target_pos
+                    
+        elif self.state == "MOVING":
+            # Move to drop location
+            drop_x, drop_y = self.drop_location
+            target_pos = self.inverse_kinematics_so101(drop_x, drop_y, self.approach_height)
+            if target_pos:
+                target_pos['gripper.pos'] = self.gripper_close_pos
+                print(f"Moving to drop location ({drop_x}, {drop_y})mm")
+                
+                obs = self.robot.robot.get_observation()
+                if self._is_at_position(obs, target_pos, tolerance=10):
+                    self.state = "DROPPING"
+                    time.sleep(0.5)
+                    
+                return target_pos
+                
+        elif self.state == "DROPPING":
+            # Lower to drop height
+            drop_x, drop_y = self.drop_location
+            target_pos = self.inverse_kinematics_so101(drop_x, drop_y, self.pick_height)
+            if target_pos:
+                # Open gripper
+                target_pos['gripper.pos'] = self.gripper_open_pos
+                print("Dropping object...")
+                
+                obs = self.robot.robot.get_observation()
+                if self._is_at_position(obs, target_pos, tolerance=5):
+                    self.state = "DONE"
+                    time.sleep(1.0)
+                    
+                return target_pos
+                
+        elif self.state == "DONE":
+            # Return to home and reset
+            print("Task completed! Returning to home...")
+            self.state = "SEARCHING"
+            self.target_object = None
+            
+            return {
+                'shoulder_pan.pos': 0.0,
+                'shoulder_lift.pos': -30.0,
+                'elbow_flex.pos': 0.0,
+                'wrist_flex.pos': -45.0,
+                'wrist_roll.pos': 0.0,
+                'gripper.pos': self.gripper_open_pos
+            }
+            
+        # Default action
+        return None
+    
+    def _is_at_position(self, observation, target_position, tolerance=5):
+        """Check if robot is at target position within tolerance"""
+        # This is simplified - you may need to adjust based on your observation format
+        for key in ['shoulder_pan.pos', 'shoulder_lift.pos', 'elbow_flex.pos']:
+            if key in observation and key in target_position:
+                current = observation[key]
+                target = target_position[key]
+                if abs(current - target) > tolerance:
+                    return False
+        return True
+
 
 class SimulatedRobotWrapper:
     """Wrapper to make simulation environment compatible with robot interface"""
@@ -122,6 +396,7 @@ class SimulatedRobotWrapper:
         
         return {"action": action_array}
 
+
 class LeRobotHardwareWithVision:
     """Real LeRobot hardware interface with SmolVLM vision"""
     
@@ -168,12 +443,52 @@ class LeRobotHardwareWithVision:
             # Real hardware
             print(f"DEBUG: robot_type = '{robot_type}'")
             
-            # Use hardcoded port for SO101, ask for others
+            # Default port for SO101
+            default_port = "/dev/tty.usbmodem5A7A0187761"
+            
+            # Auto-detect or ask for port
             if robot_type in ["so101", "so101_follower"]:
-                port = "/dev/tty.usbmodem5A7A0186301"
-                print(f"Using hardcoded port for SO101: {port}")
+                print("\nPort detection:")
+                print(f"1. Use default port: {default_port}")
+                print("2. Auto-detect port")
+                print("3. Enter port manually")
+                
+                port_choice = input("Select option [1]: ").strip() or "1"
+                
+                if port_choice == "1":
+                    port = default_port
+                    print(f"Using default port: {port}")
+                elif port_choice == "2":
+                    print("Auto-detecting robot port...")
+                    import subprocess
+                    result = subprocess.run(["python", "-m", "lerobot.find_port"], capture_output=True, text=True)
+                    print(result.stdout)
+                    detected_ports = [line for line in result.stdout.split('\n') if '/dev/tty' in line]
+                    
+                    if detected_ports:
+                        print("\nDetected ports:")
+                        for i, p in enumerate(detected_ports):
+                            print(f"{i+1}. {p}")
+                        port_idx = input(f"Select port [1]: ").strip() or "1"
+                        try:
+                            # Extract just the port path from the output
+                            port_line = detected_ports[int(port_idx)-1]
+                            # Extract /dev/tty... from the line
+                            import re
+                            port_match = re.search(r'/dev/tty\.\w+', port_line)
+                            port = port_match.group(0) if port_match else default_port
+                        except:
+                            port = default_port
+                            print(f"Invalid selection, using default: {port}")
+                    else:
+                        port = default_port
+                        print(f"No ports detected, using default: {port}")
+                else:
+                    port = input(f"Enter port [{default_port}]: ").strip() or default_port
+                
+                print(f"Using port: {port}")
             else:
-                # First, find the robot port
+                # For other robot types, ask for port
                 port = input("Enter robot port (or press Enter to auto-detect): ").strip()
                 if not port:
                     print("Auto-detecting robot port...")
@@ -219,7 +534,17 @@ class LeRobotHardwareWithVision:
                     skip_cal = input("Calibration found. Skip calibration? (y/n) [y]: ").strip().lower()
                     skip_calibration = skip_cal != 'n'
                 
-                self.robot.connect(calibrate=not skip_calibration)
+                # Check if we should allow partial motor detection
+                allow_partial = input("Allow partial motor detection? (y/n) [n]: ").strip().lower() == 'y'
+                
+                if allow_partial:
+                    print("WARNING: Running with partial motors - some functions may not work correctly")
+                    # Temporarily disable motor checking
+                    import unittest.mock
+                    with unittest.mock.patch.object(self.robot.bus, '_assert_motors_exist'):
+                        self.robot.connect(calibrate=not skip_calibration)
+                else:
+                    self.robot.connect(calibrate=not skip_calibration)
                 
                 if skip_calibration:
                     print("Skipped calibration, using existing calibration data")
@@ -282,47 +607,117 @@ class LeRobotHardwareWithVision:
         # Initialize cameras
         print("\nInitializing cameras...")
         self.cameras = {}
-        try:
-            # Try different camera indices to find a working one
-            camera_indices = [0, 1, 2]  # Try all detected cameras
-            camera_name = "front"
-            
-            for cam_idx in camera_indices:
-                try:
-                    print(f"Trying camera index {cam_idx}...")
-                    camera_config = OpenCVCameraConfig(
-                        index=cam_idx,  # Changed from camera_index to index
-                        fps=30,
-                        width=640,
-                        height=480,
-                        color_mode="rgb"
-                    )
-                    
-                    # Create and test camera
-                    test_cameras = make_cameras_from_configs({camera_name: camera_config})
-                    test_cameras[camera_name].start()
-                    
-                    # Try to read a frame
-                    frame = test_cameras[camera_name].read()
-                    if frame is not None:
-                        print(f"Camera {cam_idx} working!")
-                        self.cameras = test_cameras
-                        break
+        self.has_depth = False
+        self.cap = None
+        self.cap_depth = None
+        
+        # Try to find and initialize camera with depth support
+        camera_name = "front"
+        camera_found = False
+        
+        # Try each camera index
+        for idx in [0, 1, 2]:  # Changed order - try camera 0 first
+            try:
+                print(f"Trying camera {idx}...")
+                
+                # Try to open as RGB-D camera with OpenNI2 backend
+                cap = cv2.VideoCapture(idx, cv2.CAP_OPENNI2)
+                
+                if not cap.isOpened():
+                    # Try regular OpenCV
+                    cap = cv2.VideoCapture(idx)
+                
+                if cap.isOpened():
+                    # Check if depth is available
+                    if cap.get(cv2.CAP_PROP_OPENNI2_SYNC) != -1:
+                        # This is an RGB-D camera
+                        print(f"✓ RGB-D camera detected on index {idx}!")
+                        self.has_depth = True
+                        
+                        # Test read
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            # Test depth
+                            if cap.grab():
+                                ret_depth, depth_frame = cap.retrieve(cv2.CAP_OPENNI_DEPTH_MAP)
+                                if ret_depth and depth_frame is not None:
+                                    print(f"✓ Depth available! Shape: {depth_frame.shape}")
+                                    self.cap = cap
+                                    camera_found = True
+                                    break
                     else:
-                        test_cameras[camera_name].stop()
-                        print(f"Camera {cam_idx} failed to read")
-                except Exception as e:
-                    print(f"Camera {cam_idx} failed: {e}")
-                    continue
+                        # Regular camera
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            print(f"✓ Camera {idx} works (no depth)! Shape: {frame.shape}")
+                            self.cap = cap
+                            camera_found = True
+                            self.has_depth = False
+                            break
+                        else:
+                            cap.release()
+            except Exception as e:
+                print(f"Camera {idx} error: {e}")
+                if cap and cap.isOpened():
+                    cap.release()
+        
+        # If no depth yet, check for separate depth stream
+        if camera_found and not self.has_depth:
+            print("\nChecking for separate depth stream...")
+            for idx in range(3):
+                try:
+                    cap_test = cv2.VideoCapture(idx + 1)
+                    if cap_test.isOpened():
+                        ret, test_frame = cap_test.read()
+                        if ret and test_frame is not None and len(test_frame.shape) == 2:
+                            print(f"✓ Found potential depth stream at index {idx + 1}")
+                            self.cap_depth = cap_test
+                            self.has_depth = True
+                            break
+                        else:
+                            cap_test.release()
+                except:
+                    pass
+        
+        # Create camera wrapper
+        if camera_found:
+            class CVWrapper:
+                def __init__(self, cap, cap_depth=None, has_depth=False):
+                    self.cap = cap
+                    self.cap_depth = cap_depth
+                    self.has_depth = has_depth
                     
-            if not self.cameras:
-                print("Warning: No working cameras found")
-                # Create a dummy window for keyboard input
-                cv2.namedWindow('Robot Control', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('Robot Control', 400, 300)
-        except Exception as e:
-            print(f"Warning: Could not initialize cameras: {e}")
-            self.cameras = {}
+                def read(self):
+                    if self.cap and self.cap.isOpened():
+                        ret, frame = self.cap.read()
+                        return frame if ret else None
+                    return None
+                
+                def read_depth(self):
+                    if not self.has_depth:
+                        return None
+                        
+                    if self.cap_depth:
+                        # Separate depth stream
+                        ret, depth = self.cap_depth.read()
+                        return depth if ret else None
+                    else:
+                        # Same stream
+                        if self.cap.grab():
+                            ret, depth = self.cap.retrieve(cv2.CAP_OPENNI_DEPTH_MAP)
+                            return depth if ret else None
+                    return None
+                    
+                def __del__(self):
+                    if hasattr(self, 'cap') and self.cap:
+                        self.cap.release()
+                    if hasattr(self, 'cap_depth') and self.cap_depth:
+                        self.cap_depth.release()
+            
+            self.cameras = {camera_name: CVWrapper(self.cap, self.cap_depth, self.has_depth)}
+            print(f"Camera initialized with depth support: {self.has_depth}")
+        else:
+            print("No camera available. Running without camera.")
             # Create a dummy window for keyboard input
             cv2.namedWindow('Robot Control', cv2.WINDOW_NORMAL)
             cv2.resizeWindow('Robot Control', 400, 300)
@@ -375,6 +770,7 @@ class LeRobotHardwareWithVision:
         self.current_episode = []
         
         # Load camera calibration if available
+        self.camera_calibration = None
         self.load_camera_calibration()
         
     def auto_calibrate_camera(self):
@@ -521,9 +917,47 @@ class LeRobotHardwareWithVision:
             print("Not enough calibration points collected!")
             return False
     
-    def detect_gripper_in_image(self, image):
-        """Detect gripper in image using color/shape detection"""
+    def detect_gripper_in_image(self, image, depth_image=None):
+        """Detect gripper in image using color/shape detection or depth"""
         try:
+            if depth_image is not None and self.has_depth:
+                # Use depth for better detection
+                # Find the closest object (likely the gripper or object to grasp)
+                # Mask out very close and very far values
+                valid_depth = np.where((depth_image > 200) & (depth_image < 2000), depth_image, np.inf)
+                
+                # Find the closest point
+                if np.any(np.isfinite(valid_depth)):
+                    min_idx = np.unravel_index(np.argmin(valid_depth), valid_depth.shape)
+                    
+                    # Get a region around the closest point
+                    y, x = min_idx
+                    region_size = 50
+                    y_min = max(0, y - region_size)
+                    y_max = min(image.shape[0], y + region_size)
+                    x_min = max(0, x - region_size)
+                    x_max = min(image.shape[1], x + region_size)
+                    
+                    # Find center of mass in this region
+                    region_depth = valid_depth[y_min:y_max, x_min:x_max]
+                    if np.any(np.isfinite(region_depth)):
+                        # Calculate center of mass weighted by inverse depth
+                        y_coords, x_coords = np.mgrid[0:region_depth.shape[0], 0:region_depth.shape[1]]
+                        weights = np.where(np.isfinite(region_depth), 1.0 / (region_depth + 1), 0)
+                        
+                        total_weight = weights.sum()
+                        if total_weight > 0:
+                            cy = int((y_coords * weights).sum() / total_weight) + y_min
+                            cx = int((x_coords * weights).sum() / total_weight) + x_min
+                            
+                            # Draw detection on image
+                            cv2.circle(image, (cx, cy), 10, (0, 255, 0), -1)
+                            cv2.putText(image, f"Depth: {int(valid_depth[cy, cx])}mm", (cx-50, cy-20),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            
+                            return (cx, cy)
+            
+            # Fallback to color detection
             # Convert to HSV for better color detection
             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             
@@ -602,13 +1036,16 @@ class LeRobotHardwareWithVision:
             "homography_matrix": self.camera_calibration["homography"].tolist(),
             "calibration_points": self.camera_calibration["points"],
             "average_error": self.camera_calibration.get("avg_error", 0),
-            "camera_index": 0  # Update if using different camera
+            "camera_index": 0,  # Update if using different camera
+            "resolution": (640, 480)  # Update based on your camera
         }
         
         with open("camera_calibration.json", "w") as f:
             json.dump(data, f, indent=2)
         
         print("Calibration saved to camera_calibration.json")
+    
+    def load_camera_calibration(self, calibration_file="camera_calibration.json"):
         """Load camera calibration if available"""
         try:
             import json
@@ -620,8 +1057,8 @@ class LeRobotHardwareWithVision:
                 
                 self.camera_calibration = {
                     "homography": np.array(calib_data["homography_matrix"]),
-                    "camera_index": calib_data["camera_index"],
-                    "resolution": calib_data["resolution"]
+                    "camera_index": calib_data.get("camera_index", 0),
+                    "resolution": calib_data.get("resolution", (640, 480))
                 }
                 print(f"Loaded camera calibration from {calibration_file}")
                 return True
@@ -641,36 +1078,20 @@ class LeRobotHardwareWithVision:
         robot_x, robot_y = transformed[0][0]
         
         return robot_x, robot_y
-        """Get camera indices based on robot type"""
-        # Allow custom camera configuration
-        print("\nCamera Configuration:")
-        print("Enter camera indices (press Enter to use defaults)")
-        
-        cameras = {}
-        
-        if self.robot_type == "koch":
-            # Ask for camera index
-            default_cam = input("Enter main camera index [2]: ").strip()
-            cam_idx = int(default_cam) if default_cam else 2
-            cameras["top"] = cam_idx
-        elif self.robot_type == "aloha":
-            top_cam = input("Enter top camera index [0]: ").strip()
-            cameras["top"] = int(top_cam) if top_cam else 0
+    
+    def robot_to_pixel(self, robot_x, robot_y):
+        """Convert robot coordinates to pixel coordinates using calibration"""
+        if self.camera_calibration is None:
+            return None
             
-            left_cam = input("Enter left wrist camera index [1]: ").strip()
-            if left_cam:
-                cameras["left_wrist"] = int(left_cam)
-                
-            right_cam = input("Enter right wrist camera index [2]: ").strip()
-            if right_cam:
-                cameras["right_wrist"] = int(right_cam)
-        else:
-            # Default single camera
-            default_cam = input("Enter camera index [0]: ").strip()
-            cam_idx = int(default_cam) if default_cam else 0
-            cameras["front"] = cam_idx
-            
-        return cameras
+        # Get inverse homography
+        inv_h = np.linalg.inv(self.camera_calibration["homography"])
+        
+        point = np.array([[robot_x, robot_y]], dtype=np.float32).reshape(-1, 1, 2)
+        transformed = cv2.perspectiveTransform(point, inv_h)
+        pixel_x, pixel_y = transformed[0][0]
+        
+        return (int(pixel_x), int(pixel_y))
     
     def calibrate_robot(self):
         """Run robot calibration procedure"""
@@ -696,11 +1117,16 @@ class LeRobotHardwareWithVision:
             print(f"Calibration failed: {e}")
             raise
     
-    def detect_objects(self, image):
-        """Use vision model to detect objects and plan actions"""
+    def detect_objects(self, image, depth_frame=None):
+        """Use vision model to detect objects and plan actions, with depth support"""
         if self.vlm is None:
+            # No vision model, but we can still use depth
+            if depth_frame is not None and self.has_depth:
+                controller = PickPlaceController(self)
+                return controller.detect_objects_with_depth_only(image, depth_frame)
             return {'objects': [], 'targets': [], 'actions': [], 'robot_coords': []}
             
+        # Your existing vision model code...
         # Convert to PIL
         if isinstance(image, np.ndarray):
             pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
@@ -941,13 +1367,28 @@ class LeRobotHardwareWithVision:
         return episode_data
     
     def autonomous_mode(self):
-        """Autonomous mode with vision guidance"""
-        print("\nAutonomous Mode with Vision")
-        print("Robot will use vision to perform tasks")
-        print("Press 'q' to quit, 'space' to pause")
+        """Enhanced autonomous mode with pick and place capability"""
+        print("\nEnhanced Autonomous Pick & Place Mode")
+        print("="*50)
+        print("The robot will automatically:")
+        print("1. Search for objects using depth/vision")
+        print("2. Pick up the nearest object")
+        print("3. Move it to a designated drop zone")
+        print("\nPress 'q' to quit, 'space' to pause, 'r' to reset")
+        print("Press 'c' to auto-calibrate camera")
         
+        controller = PickPlaceController(self)
         paused = False
-        fps = 30
+        fps = 10  # Slower for pick and place
+        
+        # Check if camera calibration exists
+        if self.camera_calibration is None:
+            print("\nNo camera calibration found!")
+            cal = input("Run auto-calibration now? (y/n) [y]: ").strip().lower()
+            if cal != 'n':
+                success = self.auto_calibrate_camera()
+                if not success:
+                    print("Calibration failed. Running without calibration...")
         
         try:
             while True:
@@ -957,26 +1398,55 @@ class LeRobotHardwareWithVision:
                     # Get observation
                     observation = self.robot.get_observation()
                     
-                    # Get camera image
+                    # Get camera image and depth
                     cam_name = list(self.cameras.keys())[0] if self.cameras else None
                     if cam_name:
                         frame = self.cameras[cam_name].read()
+                        depth_frame = None
+                        
+                        if self.has_depth and hasattr(self.cameras[cam_name], 'read_depth'):
+                            depth_frame = self.cameras[cam_name].read_depth()
+                        
                         if frame is not None:
-                            # Show frame
-                            cv2.imshow('Robot Vision', frame)
+                            display_frame = frame.copy()
                             
-                            # Get vision detections
-                            detections = self.detect_objects(frame)
+                            # Get detections
+                            if self.vlm is not None:
+                                detections = self.detect_objects(display_frame, depth_frame)
+                            else:
+                                # Use depth-only detection
+                                detections = controller.detect_objects_with_depth_only(display_frame, depth_frame)
                             
-                            # Compute action
-                            action = self.vision_to_joint_action(detections, observation)
+                            # Draw current state
+                            cv2.putText(display_frame, f"State: {controller.state}", (10, 30),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                             
-                            # Apply safety limits
-                            for key in action:
-                                action[key] = np.clip(action[key], -0.1, 0.1)
+                            if controller.target_object:
+                                cv2.putText(display_frame, f"Target: ({controller.target_object[0]:.0f}, {controller.target_object[1]:.0f})mm", 
+                                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                             
-                            # Send action
-                            self.robot.send_action(action)
+                            # Draw drop zone
+                            if self.camera_calibration is not None:
+                                # Convert drop location to pixel coordinates
+                                drop_pixel = self.robot_to_pixel(controller.drop_location[0], controller.drop_location[1])
+                                if drop_pixel:
+                                    cv2.circle(display_frame, drop_pixel, 20, (255, 0, 255), 2)
+                                    cv2.putText(display_frame, "DROP", (drop_pixel[0]-20, drop_pixel[1]-25),
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                            
+                            cv2.imshow('Pick & Place Vision', display_frame)
+                            
+                            # Execute pick and place
+                            action = controller.execute_pick_place(detections)
+                            
+                            if action:
+                                # Apply safety limits
+                                for key in action:
+                                    if key != 'gripper.pos':
+                                        action[key] = np.clip(action[key], -90, 90)
+                                
+                                # Send action
+                                self.robot.send_action(action)
                 
                 # Handle keyboard
                 key = cv2.waitKey(50) & 0xFF
@@ -985,6 +1455,12 @@ class LeRobotHardwareWithVision:
                 elif key == ord(' '):
                     paused = not paused
                     print(f"{'Paused' if paused else 'Resumed'}")
+                elif key == ord('r'):
+                    controller.state = "SEARCHING"
+                    controller.target_object = None
+                    print("Reset to searching state")
+                elif key == ord('c'):
+                    self.auto_calibrate_camera()
                 
                 # Maintain FPS
                 dt_s = time.perf_counter() - loop_start
@@ -992,7 +1468,7 @@ class LeRobotHardwareWithVision:
                     time.sleep(1/fps - dt_s)
                     
         except KeyboardInterrupt:
-            print("\nAutonomous mode stopped.")
+            print("\nPick & place stopped.")
         finally:
             cv2.destroyAllWindows()
     
@@ -1146,11 +1622,12 @@ class LeRobotHardwareWithVision:
         print("Controls:")
         if self.teleop:
             print("  't' - Teleoperation mode")
-        print("  'a' - Autonomous mode (vision-guided)")
+        print("  'a' - Autonomous pick & place mode")
         print("  'p' - Pose arm (predefined positions)")
         print("  'v' - Test vision system")
         print("  'o' - Show observation")
         print("  'g' - Toggle gripper")
+        print("  'c' - Auto-calibrate camera")
         print("  'q' - Quit")
         print("="*50)
         
@@ -1214,15 +1691,19 @@ class LeRobotHardwareWithVision:
                 gripper_pos = 80.0 if gripper_open else 20.0
                 print(f"Gripper {'opening' if gripper_open else 'closing'}...")
                 self.robot.send_action({'gripper.pos': gripper_pos})
+            elif key == ord('c'):
+                # Run camera calibration
+                self.auto_calibrate_camera()
             elif key == ord('h'):
                 # Show help
                 print("\nControls:")
                 print("  q - Quit")
-                print("  a - Autonomous mode")
+                print("  a - Autonomous pick & place")
                 print("  p - Pose arm")
                 print("  v - Test vision")
                 print("  o - Show observation")
                 print("  g - Toggle gripper")
+                print("  c - Calibrate camera")
                 if self.teleop:
                     print("  t - Teleoperation")
             
@@ -1343,3 +1824,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+(base) jakehennessy@MacBookAir robot-hack % 
