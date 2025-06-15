@@ -95,31 +95,31 @@ class SO101ThrowingController:
         """
         logger.info(f"Executing overhand throw with strength {throw_strength}")
         
-        # REVERSED: Wind up CW (fast direction), throw CCW (power direction)
-        # This uses the fast CW motion for the actual throwing action
+        # Define throwing positions in DEGREES (adjust these based on your robot's workspace)
+        # Joint positions are in degrees, gripper is 0-100 (always uses RANGE_0_100 mode)
         wind_up_pos = {
             "shoulder_pan": 0,      # Centered
-            "shoulder_lift": 45,    # Shoulder UP/FORWARD (CW - the fast direction)
-            "elbow_flex": 60,       # Elbow EXTENDED (CW)
-            "wrist_flex": 30,       # Wrist UP (CW)
+            "shoulder_lift": -45,   # Shoulder back (degrees)
+            "elbow_flex": -60,      # Elbow bent back (degrees)
+            "wrist_flex": -30,      # Wrist cocked back (degrees)
             "wrist_roll": 0,        # Neutral
             "gripper": 100          # Gripping object (0-100 range)
         }
         
         throw_pos = {
-            "shoulder_pan": 0,      # Still centered  
-            "shoulder_lift": -30,   # Shoulder BACK/DOWN (CCW - power stroke)
-            "elbow_flex": -20,      # Elbow BENT (CCW - snap motion)
-            "wrist_flex": -25,      # Wrist DOWN/BACK (CCW - release snap)
+            "shoulder_pan": 0,      # Still centered
+            "shoulder_lift": 30,    # Shoulder forward (degrees)
+            "elbow_flex": 20,       # Elbow extending (degrees)
+            "wrist_flex": 25,       # Wrist snapping forward (degrees)
             "wrist_roll": 0,        # Neutral
             "gripper": 100          # Still gripping (0-100 range)
         }
         
         release_pos = {
             "shoulder_pan": 0,
-            "shoulder_lift": -45,   # Full follow through DOWN (CCW)
-            "elbow_flex": -40,      # Full snap (CCW)
-            "wrist_flex": -40,      # Full release snap (CCW)
+            "shoulder_lift": 45,    # Follow through (degrees)
+            "elbow_flex": 40,       # Full extension (degrees)
+            "wrist_flex": 40,       # Full snap (degrees)
             "wrist_roll": 0,
             "gripper": 0            # Release! (0-100 range)
         }
