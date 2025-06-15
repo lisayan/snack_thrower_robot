@@ -55,10 +55,76 @@ except ImportError:
 
 print("Loading LeRobot Hardware Interface with SmolVLM...")
 
+class SimulatedRobotWrapper:
+    """Wrapper to make simulation environment compatible with robot interface"""
+    
+    def __init__(self, env):
+        self.env = env
+        self.is_connected = True
+        self.is_calibrated = True
+        
+        # Define features based on ALOHA
+        self.observation_features = {
+            "agent_pos": {"shape": (14,), "dtype": "float32"},  # 7 DOF per arm
+            "pixels.top": {"shape": (480, 640, 3), "dtype": "uint8"}
+        }
+        
+        self.action_features = {
+            "action": {"shape": (14,), "dtype": "float32"}  # 7 DOF per arm
+        }
+        
+        # Reset to get initial observation
+        self.last_obs, _ = self.env.reset()
+    
+    def connect(self):
+        """Already connected in simulation"""
+        pass
+    
+    def disconnect(self):
+        """Close simulation"""
+        self.env.close()
+    
+    def calibrate(self):
+        """No calibration needed for simulation"""
+        pass
+    
+    def get_observation(self):
+        """Get observation from simulation"""
+        # Convert gym observation to robot format
+        obs_dict = {}
+        
+        if isinstance(self.last_obs, dict):
+            if "agent_pos" in self.last_obs:
+                obs_dict["agent_pos"] = self.last_obs["agent_pos"][0]  # Remove batch dim
+            if "pixels" in self.last_obs and "top" in self.last_obs["pixels"]:
+                obs_dict["pixels.top"] = self.last_obs["pixels"]["top"][0]
+        
+        return obs_dict
+    
+    def send_action(self, action):
+        """Send action to simulation"""
+        # Convert robot action dict to gym format
+        if isinstance(action, dict):
+            action_array = action.get("action", np.zeros(14))
+        else:
+            action_array = action
+        
+        # Add batch dimension
+        action_batch = np.expand_dims(action_array, axis=0)
+        
+        # Step simulation
+        self.last_obs, reward, terminated, truncated, info = self.env.step(action_batch)
+        
+        # Reset if episode ended
+        if terminated[0] or truncated[0]:
+            self.last_obs, _ = self.env.reset()
+        
+        return {"action": action_array}
+
 class LeRobotHardwareWithVision:
     """Real LeRobot hardware interface with SmolVLM vision"""
     
-    def __init__(self, robot_type="koch", teleop_type=None, calibration_path=None):
+    def __init__(self, robot_type="koch", teleop_type=None, calibration_path=None, use_sim=False):
         """
         Initialize robot hardware and vision system
         
@@ -66,58 +132,87 @@ class LeRobotHardwareWithVision:
             robot_type: Type of robot ('koch', 'aloha', 'so100', 'so101')
             teleop_type: Type of teleoperator (e.g., 'so100_leader', 'koch_leader')
             calibration_path: Path to calibration directory
+            use_sim: Use simulation instead of real hardware
         """
         self.robot_type = robot_type
+        self.use_sim = use_sim
         
         # Initialize logging
         init_logging()
         
         # Create robot configuration
-        print(f"Initializing {robot_type} robot hardware...")
+        print(f"Initializing {robot_type} {'simulation' if use_sim else 'robot hardware'}...")
         
-        # First, find the robot port
-        port = input("Enter robot port (or press Enter to auto-detect): ").strip()
-        if not port:
-            print("Auto-detecting robot port...")
-            import subprocess
-            result = subprocess.run(["python", "-m", "lerobot.find_port"], capture_output=True, text=True)
-            print(result.stdout)
-            port = input("Enter the detected port: ").strip()
-        
-        # Build robot config based on type
-        if robot_type == "koch" or robot_type == "koch_follower":
-            robot_config = KochFollowerConfig(
-                port=port,
-                calibration_dir=Path(calibration_path or f".cache/calibration/{robot_type}")
-            )
-        elif robot_type == "so100" or robot_type == "so100_follower":
-            robot_config = SO100FollowerConfig(
-                port=port,
-                calibration_dir=Path(calibration_path or f".cache/calibration/{robot_type}")
-            )
-        elif robot_type == "so101" or robot_type == "so101_follower":
-            robot_config = SO101FollowerConfig(
-                port=port,
-                calibration_dir=Path(calibration_path or f".cache/calibration/{robot_type}")
-            )
+        if use_sim and robot_type == "aloha":
+            # Use ALOHA simulation
+            try:
+                from lerobot.common.envs.factory import make_env, EnvConfig
+                
+                print("Creating ALOHA simulation environment...")
+                env_config = EnvConfig(
+                    env_name="aloha",
+                    task="AlohaInsertion-v0",
+                    episode_length=400,
+                    video_dir=Path("videos") if calibration_path else None
+                )
+                
+                self.sim_env = make_env(env_config, n_envs=1)
+                self.robot = SimulatedRobotWrapper(self.sim_env)
+                print("ALOHA simulation initialized!")
+                
+            except Exception as e:
+                print(f"Failed to create ALOHA simulation: {e}")
+                raise
         else:
-            raise ValueError(f"Unknown robot type: {robot_type}. Supported: koch, so100, so101")
-        
-        # Create robot instance
-        try:
-            self.robot = make_robot_from_config(robot_config)
-            self.robot.connect()
-            print(f"Robot connected successfully!")
-            print(f"Observation features: {self.robot.observation_features}")
-            print(f"Action features: {self.robot.action_features}")
+            # Real hardware
+            # Use hardcoded port for SO101, ask for others
+            if robot_type in ["so101", "so101_follower"]:
+                port = "/dev/tty.usbmodem5A7A0186301"
+                print(f"Using hardcoded port for SO101: {port}")
+            else:
+                # First, find the robot port
+                port = input("Enter robot port (or press Enter to auto-detect): ").strip()
+                if not port:
+                    print("Auto-detecting robot port...")
+                    import subprocess
+                    result = subprocess.run(["python", "-m", "lerobot.find_port"], capture_output=True, text=True)
+                    print(result.stdout)
+                    port = input("Enter the detected port: ").strip()
             
-        except Exception as e:
-            print(f"Failed to initialize robot hardware: {e}")
-            print("\nMake sure:")
-            print("1. Robot is connected and powered on")
-            print("2. You have the correct permissions (may need sudo)")
-            print("3. Motors are properly configured (run: python -m lerobot.setup_motors)")
-            raise
+            # Build robot config based on type
+            if robot_type == "koch" or robot_type == "koch_follower":
+                robot_config = KochFollowerConfig(
+                    port=port,
+                    calibration_dir=Path(calibration_path or f".cache/calibration/{robot_type}")
+                )
+            elif robot_type == "so100" or robot_type == "so100_follower":
+                robot_config = SO100FollowerConfig(
+                    port=port,
+                    calibration_dir=Path(calibration_path or f".cache/calibration/{robot_type}")
+                )
+            elif robot_type == "so101" or robot_type == "so101_follower":
+                robot_config = SO101FollowerConfig(
+                    port=port,
+                    calibration_dir=Path(calibration_path or f".cache/calibration/{robot_type}")
+                )
+            else:
+                raise ValueError(f"Unknown robot type: {robot_type}. Supported: koch, so100, so101")
+            
+            # Create robot instance
+            try:
+                self.robot = make_robot_from_config(robot_config)
+                self.robot.connect()
+                print(f"Robot connected successfully!")
+                print(f"Observation features: {self.robot.observation_features}")
+                print(f"Action features: {self.robot.action_features}")
+                
+            except Exception as e:
+                print(f"Failed to initialize robot hardware: {e}")
+                print("\nMake sure:")
+                print("1. Robot is connected and powered on")
+                print("2. You have the correct permissions (may need sudo)")
+                print("3. Motors are properly configured (run: python -m lerobot.setup_motors)")
+                raise
         
         # Initialize teleoperator if specified
         self.teleop = None
@@ -274,6 +369,10 @@ class LeRobotHardwareWithVision:
     
     def calibrate_robot(self):
         """Run robot calibration procedure"""
+        if self.use_sim:
+            print("Simulation doesn't need calibration")
+            return
+            
         print("\nStarting robot calibration...")
         print("This will move the robot to find joint limits")
         print("Make sure the area is clear!")
@@ -665,31 +764,41 @@ class LeRobotHardwareWithVision:
 def main():
     print("\nLeRobot Hardware Interface")
     print("="*50)
-    print("Available robots:", ["koch", "so100", "so101"])
+    print("Available robots:", ["koch", "so100", "so101", "aloha-sim"])
     
     # Get robot type
-    robot_type = input("Enter robot type [so101]: ").strip() or "so101"
+    robot_type_input = input("Enter robot type [so101]: ").strip() or "so101"
     
-    # Check if teleoperation is desired
-    use_teleop = input("Enable teleoperation? (y/n) [n]: ").strip().lower() == 'y'
+    # Check if it's simulation
+    use_sim = False
+    if robot_type_input == "aloha-sim":
+        robot_type = "aloha"
+        use_sim = True
+    else:
+        robot_type = robot_type_input
+    
+    # Check if teleoperation is desired (not for simulation)
     teleop_type = None
-    
-    if use_teleop and TELEOP_AVAILABLE:
-        # Map robot type to teleop type
-        teleop_map = {
-            "koch": "koch_leader",
-            "so100": "so100_leader", 
-            "so101": "so101_leader"
-        }
-        teleop_type = teleop_map.get(robot_type)
-        if not teleop_type or teleop_type == "koch_leader":
-            print(f"Note: Teleoperation for {robot_type} may require custom setup")
-            teleop_type = None
+    if not use_sim:
+        use_teleop = input("Enable teleoperation? (y/n) [n]: ").strip().lower() == 'y'
+        
+        if use_teleop and TELEOP_AVAILABLE:
+            # Map robot type to teleop type
+            teleop_map = {
+                "koch": "koch_leader",
+                "so100": "so100_leader", 
+                "so101": "so101_leader"
+            }
+            teleop_type = teleop_map.get(robot_type)
+            if not teleop_type or teleop_type == "koch_leader":
+                print(f"Note: Teleoperation for {robot_type} may require custom setup")
+                teleop_type = None
     
     try:
         robot = LeRobotHardwareWithVision(
             robot_type=robot_type,
-            teleop_type=teleop_type
+            teleop_type=teleop_type,
+            use_sim=use_sim
         )
     except Exception as e:
         print(f"\nFailed to initialize robot: {e}")
