@@ -1,3 +1,4 @@
+(base) jakehennessy@MacBookAir robot-hack % cat intergrated_pick.py
 #!/usr/bin/env python3
 """
 Real LeRobot Hardware Integration with SmolVLM for vision-based control
@@ -210,7 +211,21 @@ class LeRobotHardwareWithVision:
                 self.robot = make_robot_from_config(robot_config)
                 print("Robot instance created, attempting to connect...")
                 
-                self.robot.connect()
+                # Check if we should skip calibration
+                calibration_path = Path(calibration_path or f".cache/calibration/{robot_type}")
+                skip_calibration = False
+                
+                if calibration_path.exists():
+                    skip_cal = input("Calibration found. Skip calibration? (y/n) [y]: ").strip().lower()
+                    skip_calibration = skip_cal != 'n'
+                
+                self.robot.connect(calibrate=not skip_calibration)
+                
+                if skip_calibration:
+                    print("Skipped calibration, using existing calibration data")
+                else:
+                    print("Calibration completed")
+                
                 print(f"Robot connected successfully!")
                 print(f"Robot is_connected: {self.robot.is_connected}")
                 print(f"Robot is_calibrated: {self.robot.is_calibrated}")
@@ -268,48 +283,92 @@ class LeRobotHardwareWithVision:
         print("\nInitializing cameras...")
         self.cameras = {}
         try:
-            # Get camera indices based on robot type
-            camera_indices = self.get_camera_indices()
+            # Try different camera indices to find a working one
+            camera_indices = [0, 1, 2]  # Try all detected cameras
+            camera_name = "front"
             
-            # Create camera configs
-            camera_configs = {}
-            for cam_name, cam_idx in camera_indices.items():
-                camera_configs[cam_name] = OpenCVCameraConfig(
-                    camera_index=cam_idx,
-                    fps=30,
-                    width=640,
-                    height=480,
-                    color_mode="rgb"
-                )
-            
-            # Create cameras from configs
-            self.cameras = make_cameras_from_configs(camera_configs)
-            
-            # Start cameras
-            for camera in self.cameras.values():
-                camera.start()
-                
-            print(f"Cameras initialized: {list(self.cameras.keys())}")
+            for cam_idx in camera_indices:
+                try:
+                    print(f"Trying camera index {cam_idx}...")
+                    camera_config = OpenCVCameraConfig(
+                        index=cam_idx,  # Changed from camera_index to index
+                        fps=30,
+                        width=640,
+                        height=480,
+                        color_mode="rgb"
+                    )
+                    
+                    # Create and test camera
+                    test_cameras = make_cameras_from_configs({camera_name: camera_config})
+                    test_cameras[camera_name].start()
+                    
+                    # Try to read a frame
+                    frame = test_cameras[camera_name].read()
+                    if frame is not None:
+                        print(f"Camera {cam_idx} working!")
+                        self.cameras = test_cameras
+                        break
+                    else:
+                        test_cameras[camera_name].stop()
+                        print(f"Camera {cam_idx} failed to read")
+                except Exception as e:
+                    print(f"Camera {cam_idx} failed: {e}")
+                    continue
+                    
+            if not self.cameras:
+                print("Warning: No working cameras found")
+                # Create a dummy window for keyboard input
+                cv2.namedWindow('Robot Control', cv2.WINDOW_NORMAL)
+                cv2.resizeWindow('Robot Control', 400, 300)
         except Exception as e:
             print(f"Warning: Could not initialize cameras: {e}")
             self.cameras = {}
+            # Create a dummy window for keyboard input
+            cv2.namedWindow('Robot Control', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Robot Control', 400, 300)
         
         # Load SmolVLM
-        print("\nLoading SmolVLM2...")
+        print("\nLoading vision model...")
         try:
-            self.processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
+            # Use the correct available SmolVLM model
+            model_name = "HuggingFaceTB/SmolVLM-Instruct"  # The currently available model
+            
+            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
             self.vlm = AutoModelForImageTextToText.from_pretrained(
-                "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
-                torch_dtype=torch.float32,
+                model_name,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 trust_remote_code=True
-            ).to("cpu")
+            )
+            
+            # Move to appropriate device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.vlm = self.vlm.to(device)
+            self.device = device
             self.vlm.eval()
-            print("SmolVLM loaded!")
+            
+            print(f"SmolVLM loaded successfully on {device}!")
+            self.use_blip = False
         except Exception as e:
-            print(f"Error loading SmolVLM: {e}")
-            print("Continuing without vision model...")
-            self.processor = None
-            self.vlm = None
+            print(f"Could not load SmolVLM: {e}")
+            print("Loading BLIP as vision model...")
+            try:
+                # Use BLIP which is downloading successfully
+                from transformers import BlipProcessor, BlipForConditionalGeneration
+                
+                model_name = "Salesforce/blip-image-captioning-base"
+                self.processor = BlipProcessor.from_pretrained(model_name)
+                self.vlm = BlipForConditionalGeneration.from_pretrained(model_name)
+                self.device = "cpu"
+                self.vlm.eval()
+                print("BLIP vision model loaded successfully!")
+                self.use_blip = True
+            except Exception as e2:
+                print(f"Error loading vision models: {e2}")
+                print("Continuing without vision model...")
+                self.processor = None
+                self.vlm = None
+                self.use_blip = False
+                self.device = "cpu"
         
         # Dataset for recording
         self.dataset = None
@@ -318,7 +377,238 @@ class LeRobotHardwareWithVision:
         # Load camera calibration if available
         self.load_camera_calibration()
         
-    def load_camera_calibration(self, calibration_file="camera_calibration.json"):
+    def auto_calibrate_camera(self):
+        """Automatic camera calibration using robot arm positions"""
+        if not self.cameras:
+            print("No camera available for calibration!")
+            return False
+            
+        print("\nAutomatic Camera Calibration")
+        print("="*50)
+        print("The robot will move to several positions.")
+        print("The system will detect the gripper automatically.")
+        print("\nMake sure:")
+        print("1. The workspace is clear")
+        print("2. The camera can see the robot gripper")
+        print("3. Good lighting conditions")
+        print("\nPress Enter to start or 'q' to cancel...")
+        
+        if input().strip().lower() == 'q':
+            return False
+        
+        calibration_points = []
+        cam_name = list(self.cameras.keys())[0]
+        
+        # Define positions to move to (in mm from base)
+        # These are relative positions that should be visible in camera
+        positions = [
+            (-100, 250, "Left Near"),
+            (100, 250, "Right Near"),
+            (100, 350, "Right Far"),
+            (-100, 350, "Left Far"),
+            (0, 300, "Center"),
+            (-150, 300, "Far Left"),
+            (150, 300, "Far Right"),
+            (0, 200, "Close Center"),
+        ]
+        
+        # Open gripper for better visibility
+        print("Opening gripper for visibility...")
+        self.robot.send_action({'gripper.pos': 80.0})
+        time.sleep(1)
+        
+        for i, (x, y, name) in enumerate(positions):
+            print(f"\nPosition {i+1}/{len(positions)}: {name} ({x}, {y})mm")
+            
+            try:
+                # Calculate rough joint positions for SO101
+                # This is simplified - adjust based on your robot's kinematics
+                distance = np.sqrt(x**2 + y**2)
+                angle = np.arctan2(x, y) * 180 / np.pi
+                
+                action = {
+                    'shoulder_pan.pos': angle,  # Pan to face the position
+                    'shoulder_lift.pos': -30.0 - (distance / 10),  # Adjust based on distance
+                    'elbow_flex.pos': -45.0,
+                    'wrist_flex.pos': -45.0,
+                    'wrist_roll.pos': 0.0,
+                    'gripper.pos': 80.0  # Keep gripper open
+                }
+                
+                # Send action
+                self.robot.send_action(action)
+                print("Moving... (waiting 3 seconds)")
+                time.sleep(3)  # Wait for movement to complete
+                
+                # Capture image
+                frame = self.cameras[cam_name].read()
+                if frame is None:
+                    print("Failed to capture image!")
+                    continue
+                
+                # Try to detect gripper
+                gripper_pixel = self.detect_gripper_in_image(frame.copy())
+                
+                if gripper_pixel is not None:
+                    px, py = gripper_pixel
+                    calibration_points.append((px, py, x, y))
+                    
+                    # Show detection
+                    display_frame = frame.copy()
+                    cv2.circle(display_frame, (px, py), 10, (0, 255, 0), -1)
+                    cv2.putText(display_frame, f"Detected at ({x}, {y})mm", (px-50, py-20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                else:
+                    # Manual fallback
+                    print("Automatic detection failed. Please click on the gripper.")
+                    display_frame = frame.copy()
+                    cv2.putText(display_frame, "Click on gripper position", (50, 50),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    
+                    # Get manual click
+                    clicked_point = [None]
+                    
+                    def mouse_callback(event, mx, my, flags, param):
+                        if event == cv2.EVENT_LBUTTONDOWN:
+                            clicked_point[0] = (mx, my)
+                    
+                    cv2.namedWindow('Calibration')
+                    cv2.setMouseCallback('Calibration', mouse_callback)
+                    
+                    while clicked_point[0] is None:
+                        cv2.imshow('Calibration', display_frame)
+                        if cv2.waitKey(1) & 0xFF == 27:  # ESC
+                            cv2.destroyAllWindows()
+                            return False
+                    
+                    px, py = clicked_point[0]
+                    calibration_points.append((px, py, x, y))
+                    print(f"Manual click at pixel ({px}, {py})")
+                
+                # Show progress
+                cv2.putText(display_frame, f"Point {i+1}/{len(positions)} collected", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow('Calibration', display_frame)
+                cv2.waitKey(1000)
+                
+            except Exception as e:
+                print(f"Error at position {name}: {e}")
+                continue
+        
+        cv2.destroyAllWindows()
+        
+        # Compute calibration if we have enough points
+        if len(calibration_points) >= 4:
+            print(f"\nCollected {len(calibration_points)} calibration points")
+            success = self._compute_homography_from_points(calibration_points)
+            
+            if success:
+                print("✓ Calibration successful!")
+                self._save_camera_calibration()
+                
+                # Return to home position
+                print("Returning to home position...")
+                self.robot.send_action({
+                    'shoulder_pan.pos': 0.0,
+                    'shoulder_lift.pos': -30.0,
+                    'elbow_flex.pos': 0.0,
+                    'wrist_flex.pos': -45.0,
+                    'wrist_roll.pos': 0.0,
+                    'gripper.pos': 50.0
+                })
+                return True
+        else:
+            print("Not enough calibration points collected!")
+            return False
+    
+    def detect_gripper_in_image(self, image):
+        """Detect gripper in image using color/shape detection"""
+        try:
+            # Convert to HSV for better color detection
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            
+            # Look for gripper colors (adjust these for your gripper)
+            # This example looks for dark/metallic colors
+            lower_bound = np.array([0, 0, 20])
+            upper_bound = np.array([180, 100, 100])
+            
+            # Create mask
+            mask = cv2.inRange(hsv, lower_bound, upper_bound)
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # Find largest contour (likely the gripper)
+                largest = max(contours, key=cv2.contourArea)
+                
+                # Get center of contour
+                M = cv2.moments(largest)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    return (cx, cy)
+            
+            return None
+            
+        except Exception as e:
+            print(f"Gripper detection error: {e}")
+            return None
+    
+    def _compute_homography_from_points(self, calibration_points):
+        """Compute homography from calibration points"""
+        if len(calibration_points) < 4:
+            return False
+        
+        # Separate pixel and robot coordinates
+        src_points = np.array([(p[0], p[1]) for p in calibration_points], dtype=np.float32)
+        dst_points = np.array([(p[2], p[3]) for p in calibration_points], dtype=np.float32)
+        
+        # Compute homography
+        self.camera_calibration = {}
+        self.camera_calibration["homography"], mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
+        
+        if self.camera_calibration["homography"] is not None:
+            # Test accuracy
+            total_error = 0
+            for px, py, rx, ry in calibration_points:
+                # Transform pixel to robot
+                point = np.array([[px, py]], dtype=np.float32).reshape(-1, 1, 2)
+                transformed = cv2.perspectiveTransform(point, self.camera_calibration["homography"])
+                pred_x, pred_y = transformed[0][0]
+                
+                error = np.sqrt((pred_x - rx)**2 + (pred_y - ry)**2)
+                total_error += error
+                print(f"Point ({px},{py}) -> ({rx},{ry}): error = {error:.1f}mm")
+            
+            avg_error = total_error / len(calibration_points)
+            print(f"\nAverage calibration error: {avg_error:.1f}mm")
+            
+            self.camera_calibration["points"] = calibration_points
+            self.camera_calibration["avg_error"] = avg_error
+            
+            return True
+        
+        return False
+    
+    def _save_camera_calibration(self):
+        """Save calibration to file"""
+        if self.camera_calibration is None:
+            return
+            
+        data = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "robot_type": self.robot_type,
+            "homography_matrix": self.camera_calibration["homography"].tolist(),
+            "calibration_points": self.camera_calibration["points"],
+            "average_error": self.camera_calibration.get("avg_error", 0),
+            "camera_index": 0  # Update if using different camera
+        }
+        
+        with open("camera_calibration.json", "w") as f:
+            json.dump(data, f, indent=2)
+        
+        print("Calibration saved to camera_calibration.json")
         """Load camera calibration if available"""
         try:
             import json
@@ -407,9 +697,9 @@ class LeRobotHardwareWithVision:
             raise
     
     def detect_objects(self, image):
-        """Use SmolVLM to detect objects and plan actions"""
+        """Use vision model to detect objects and plan actions"""
         if self.vlm is None:
-            return {'objects': [], 'targets': [], 'actions': []}
+            return {'objects': [], 'targets': [], 'actions': [], 'robot_coords': []}
             
         # Convert to PIL
         if isinstance(image, np.ndarray):
@@ -417,85 +707,124 @@ class LeRobotHardwareWithVision:
         else:
             pil_img = image
         
-        # Task-specific prompts
-        if self.robot_type in ["so100", "so101"]:
-            prompt = """Analyze this robot workspace. I have an SO-101 robot arm.
-            Identify:
-            1. Any graspable objects (blocks, cups, toys)
-            2. Target locations (plates, containers, goals)
-            3. The robot gripper position
-            4. Suggested action: 'move_to: x,y', 'grasp', 'release', or 'home'
-            Return coordinates and action."""
-        elif self.robot_type == "koch":
-            prompt = """Analyze this robot workspace. I have a Koch robot arm.
-            Identify:
-            1. Any graspable objects (blocks, cups, toys)
-            2. Target locations (plates, containers, goals)
-            3. The robot gripper position
-            4. Suggested action: 'move_to: x,y', 'grasp', 'release', or 'home'
-            Return coordinates and action."""
-        else:
-            prompt = """Analyze this robot workspace. 
-            Identify objects, targets, and robot position.
-            Suggest next action with coordinates."""
-        
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt}
-            ]
-        }]
-        
         try:
-            prompt_text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
-            inputs = self.processor(text=prompt_text, images=[pil_img], return_tensors="pt")
-            
-            with torch.no_grad():
-                generated_ids = self.vlm.generate(**inputs, do_sample=False, max_new_tokens=150)
-            
-            response = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            print(f"Vision: {response}")
-            
-            # Parse response
-            detections = {
-                'objects': [],
-                'targets': [],
-                'actions': [],
-                'robot_coords': []  # Add robot coordinates
-            }
-            
-            # Extract positions
-            object_matches = re.findall(r'object:\s*(\d+),\s*(\d+)', response)
-            for x, y in object_matches:
-                pixel_x, pixel_y = int(x), int(y)
-                detections['objects'].append((pixel_x, pixel_y))
+            if hasattr(self, 'use_blip') and self.use_blip:
+                # Use BLIP for basic object detection
+                inputs = self.processor(pil_img, return_tensors="pt")
+                out = self.vlm.generate(**inputs, max_length=50)
+                description = self.processor.decode(out[0], skip_special_tokens=True)
+                print(f"BLIP vision: {description}")
                 
-                # Convert to robot coordinates if calibrated
-                if self.camera_calibration is not None:
-                    robot_x, robot_y = self.pixel_to_robot(pixel_x, pixel_y)
-                    detections['robot_coords'].append((robot_x, robot_y))
-                    print(f"Object at pixel ({pixel_x}, {pixel_y}) -> robot ({robot_x:.1f}, {robot_y:.1f})mm")
-            
-            target_matches = re.findall(r'target:\s*(\d+),\s*(\d+)', response)
-            for x, y in target_matches:
-                detections['targets'].append((int(x), int(y)))
-            
-            # Extract actions
-            if 'grasp' in response.lower():
-                detections['actions'].append('grasp')
-            elif 'release' in response.lower():
-                detections['actions'].append('release')
-            elif 'move_to' in response.lower():
-                move_matches = re.findall(r'move_to:\s*(\d+),\s*(\d+)', response)
-                if move_matches:
-                    detections['actions'].append(('move_to', int(move_matches[0][0]), int(move_matches[0][1])))
-            
-            return detections
-            
+                # Simple keyword detection
+                detections = {
+                    'objects': [],
+                    'targets': [],
+                    'actions': [],
+                    'robot_coords': []
+                }
+                
+                # Look for keywords
+                if any(word in description.lower() for word in ['block', 'cube', 'object', 'toy']):
+                    # Assume object in center for now
+                    detections['objects'].append((320, 240))
+                    if self.camera_calibration is not None:
+                        robot_x, robot_y = self.pixel_to_robot(320, 240)
+                        detections['robot_coords'].append((robot_x, robot_y))
+                
+                if 'grasp' in description.lower() or 'pick' in description.lower():
+                    detections['actions'].append('grasp')
+                elif 'release' in description.lower() or 'drop' in description.lower():
+                    detections['actions'].append('release')
+                
+                return detections
+            else:
+                # Original SmolVLM code
+                # Task-specific prompts
+                if self.robot_type in ["so100", "so101"]:
+                    prompt = """Analyze this robot workspace. I have an SO-101 robot arm.
+                    Identify:
+                    1. Any graspable objects (blocks, cups, toys)
+                    2. Target locations (plates, containers, goals)
+                    3. The robot gripper position
+                    4. Suggested action: 'move_to: x,y', 'grasp', 'release', or 'home'
+                    Return coordinates and action."""
+                elif self.robot_type == "koch":
+                    prompt = """Analyze this robot workspace. I have a Koch robot arm.
+                    Identify:
+                    1. Any graspable objects (blocks, cups, toys)
+                    2. Target locations (plates, containers, goals)
+                    3. The robot gripper position
+                    4. Suggested action: 'move_to: x,y', 'grasp', 'release', or 'home'
+                    Return coordinates and action."""
+                else:
+                    prompt = """Analyze this robot workspace. 
+                    Identify objects, targets, and robot position.
+                    Suggest next action with coordinates."""
+                
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+                
+                prompt_text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+                inputs = self.processor(text=prompt_text, images=[pil_img], return_tensors="pt")
+                
+                # Move inputs to device
+                inputs = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    generated_ids = self.vlm.generate(**inputs, do_sample=False, max_new_tokens=150)
+                
+                response = self.processor.decode(generated_ids[0], skip_special_tokens=True)
+                
+                # Extract just the assistant's response
+                if "<|assistant|>" in response:
+                    response = response.split("<|assistant|>")[-1].strip()
+                
+                print(f"Vision: {response}")
+                
+                # Parse response
+                detections = {
+                    'objects': [],
+                    'targets': [],
+                    'actions': [],
+                    'robot_coords': []  # Add robot coordinates
+                }
+                
+                # Extract positions
+                object_matches = re.findall(r'object:\s*(\d+),\s*(\d+)', response)
+                for x, y in object_matches:
+                    pixel_x, pixel_y = int(x), int(y)
+                    detections['objects'].append((pixel_x, pixel_y))
+                    
+                    # Convert to robot coordinates if calibrated
+                    if self.camera_calibration is not None:
+                        robot_x, robot_y = self.pixel_to_robot(pixel_x, pixel_y)
+                        detections['robot_coords'].append((robot_x, robot_y))
+                        print(f"Object at pixel ({pixel_x}, {pixel_y}) -> robot ({robot_x:.1f}, {robot_y:.1f})mm")
+                
+                target_matches = re.findall(r'target:\s*(\d+),\s*(\d+)', response)
+                for x, y in target_matches:
+                    detections['targets'].append((int(x), int(y)))
+                
+                # Extract actions
+                if 'grasp' in response.lower():
+                    detections['actions'].append('grasp')
+                elif 'release' in response.lower():
+                    detections['actions'].append('release')
+                elif 'move_to' in response.lower():
+                    move_matches = re.findall(r'move_to:\s*(\d+),\s*(\d+)', response)
+                    if move_matches:
+                        detections['actions'].append(('move_to', int(move_matches[0][0]), int(move_matches[0][1])))
+                
+                return detections
+                
         except Exception as e:
             print(f"Vision error: {e}")
-            return {'objects': [], 'targets': [], 'actions': []}
+            return {'objects': [], 'targets': [], 'actions': [], 'robot_coords': []}
     
     def vision_to_joint_action(self, detections, current_obs):
         """Convert vision detections to joint actions"""
@@ -724,6 +1053,92 @@ class LeRobotHardwareWithVision:
         
         return self.dataset
     
+    def pose_arm(self):
+        """Move arm to predefined poses"""
+        print("\nArm Posing Mode")
+        print("="*50)
+        print("Poses:")
+        print("  'h' - Home position")
+        print("  'r' - Ready position")
+        print("  'p' - Pick position")
+        print("  'd' - Drop position")
+        print("  'w' - Wave")
+        print("  'q' - Quit posing mode")
+        print("="*50)
+        
+        # Define poses (adjust these values for your SO101)
+        poses = {
+            'h': {  # Home
+                'shoulder_pan.pos': 0.0,
+                'shoulder_lift.pos': -30.0,
+                'elbow_flex.pos': 0.0,
+                'wrist_flex.pos': -45.0,
+                'wrist_roll.pos': 0.0,
+                'gripper.pos': 50.0
+            },
+            'r': {  # Ready
+                'shoulder_pan.pos': 0.0,
+                'shoulder_lift.pos': -45.0,
+                'elbow_flex.pos': -45.0,
+                'wrist_flex.pos': -45.0,
+                'wrist_roll.pos': 0.0,
+                'gripper.pos': 80.0  # Open gripper
+            },
+            'p': {  # Pick
+                'shoulder_pan.pos': 0.0,
+                'shoulder_lift.pos': -60.0,
+                'elbow_flex.pos': -90.0,
+                'wrist_flex.pos': -30.0,
+                'wrist_roll.pos': 0.0,
+                'gripper.pos': 80.0  # Open gripper
+            },
+            'd': {  # Drop
+                'shoulder_pan.pos': 45.0,
+                'shoulder_lift.pos': -45.0,
+                'elbow_flex.pos': -45.0,
+                'wrist_flex.pos': -45.0,
+                'wrist_roll.pos': 0.0,
+                'gripper.pos': 20.0  # Closed gripper
+            }
+        }
+        
+        while True:
+            key = cv2.waitKey(0) & 0xFF
+            
+            if key == ord('q'):
+                break
+            elif key == ord('h'):
+                print("Moving to home position...")
+                self.robot.send_action(poses['h'])
+            elif key == ord('r'):
+                print("Moving to ready position...")
+                self.robot.send_action(poses['r'])
+            elif key == ord('p'):
+                print("Moving to pick position...")
+                self.robot.send_action(poses['p'])
+            elif key == ord('d'):
+                print("Moving to drop position...")
+                self.robot.send_action(poses['d'])
+            elif key == ord('w'):
+                # Wave animation
+                print("Waving...")
+                for i in range(3):
+                    wave_left = poses['h'].copy()
+                    wave_left['shoulder_pan.pos'] = -30.0
+                    self.robot.send_action(wave_left)
+                    time.sleep(0.5)
+                    
+                    wave_right = poses['h'].copy()
+                    wave_right['shoulder_pan.pos'] = 30.0
+                    self.robot.send_action(wave_right)
+                    time.sleep(0.5)
+                
+                self.robot.send_action(poses['h'])
+            
+            # Show current position
+            obs = self.robot.get_observation()
+            print(f"Current position: {obs}")
+    
     def run_interactive(self):
         """Run robot with interactive control"""
         print("\nInteractive Robot Control")
@@ -732,24 +1147,44 @@ class LeRobotHardwareWithVision:
         if self.teleop:
             print("  't' - Teleoperation mode")
         print("  'a' - Autonomous mode (vision-guided)")
+        print("  'p' - Pose arm (predefined positions)")
         print("  'v' - Test vision system")
         print("  'o' - Show observation")
+        print("  'g' - Toggle gripper")
         print("  'q' - Quit")
         print("="*50)
         
         fps = 30
+        gripper_open = True
         
         while True:
             loop_start = time.perf_counter()
             
-            # Show camera feed
-            cam_name = list(self.cameras.keys())[0] if self.cameras else None
-            if cam_name:
+            # Show camera feed if available
+            if self.cameras:
+                cam_name = list(self.cameras.keys())[0]
                 frame = self.cameras[cam_name].read()
                 if frame is not None:
+                    # Add text overlay
+                    cv2.putText(frame, "SO101 Robot Control", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(frame, "Press 'h' for help", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                     cv2.imshow('Robot Camera', frame)
+            else:
+                # No camera - create a blank window for keyboard input
+                blank = np.zeros((300, 400, 3), dtype=np.uint8)
+                cv2.putText(blank, "SO101 Robot Control", (50, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(blank, "No Camera Found", (80, 100),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+                cv2.putText(blank, "Press 'p' for poses", (80, 150),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.putText(blank, "Press 'h' for help", (80, 180),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.imshow('Robot Control', blank)
             
-            key = cv2.waitKey(50) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
             
             if key == ord('q'):
                 break
@@ -757,17 +1192,39 @@ class LeRobotHardwareWithVision:
                 self.teleop_mode()
             elif key == ord('a'):
                 self.autonomous_mode()
+            elif key == ord('p'):
+                self.pose_arm()
             elif key == ord('v'):
                 # Test vision
-                if cam_name and self.vlm is not None:
+                if self.cameras and self.vlm is not None:
+                    cam_name = list(self.cameras.keys())[0]
                     frame = self.cameras[cam_name].read()
                     if frame is not None:
                         detections = self.detect_objects(frame)
                         print(f"Vision detections: {detections}")
+                else:
+                    print("No camera or vision model available")
             elif key == ord('o'):
                 # Show observation
                 obs = self.robot.get_observation()
                 print(f"Current observation: {obs}")
+            elif key == ord('g'):
+                # Toggle gripper
+                gripper_open = not gripper_open
+                gripper_pos = 80.0 if gripper_open else 20.0
+                print(f"Gripper {'opening' if gripper_open else 'closing'}...")
+                self.robot.send_action({'gripper.pos': gripper_pos})
+            elif key == ord('h'):
+                # Show help
+                print("\nControls:")
+                print("  q - Quit")
+                print("  a - Autonomous mode")
+                print("  p - Pose arm")
+                print("  v - Test vision")
+                print("  o - Show observation")
+                print("  g - Toggle gripper")
+                if self.teleop:
+                    print("  t - Teleoperation")
             
             # Maintain FPS
             dt_s = time.perf_counter() - loop_start
@@ -854,13 +1311,22 @@ def main():
             print("\nFinding cameras...")
             subprocess.run(["python", "-m", "lerobot.find_cameras"])
         elif choice == "6":
-            # Run camera calibration
-            print("\nCamera Calibration")
-            cam_idx = input("Enter camera index to calibrate [2]: ").strip() or "2"
-            mode = input("Calibration mode (quick/advanced/test) [quick]: ").strip() or "quick"
+            # Run automatic camera calibration
+            print("\nCamera Calibration Options:")
+            print("1. Automatic (using robot arm)")
+            print("2. Manual (using markers)")
             
-            import subprocess
-            subprocess.run(["python", "camera_calibration.py", "--camera", cam_idx, "--mode", mode])
+            cal_choice = input("Select method [1]: ").strip() or "1"
+            
+            if cal_choice == "1":
+                robot.auto_calibrate_camera()
+            else:
+                # Run manual calibration
+                cam_idx = input("Enter camera index to calibrate [0]: ").strip() or "0"
+                mode = input("Calibration mode (quick/advanced/test) [quick]: ").strip() or "quick"
+                
+                import subprocess
+                subprocess.run(["python", "camera_calibration.py", "--camera", cam_idx, "--mode", mode])
             
             # Reload calibration
             robot.load_camera_calibration()
