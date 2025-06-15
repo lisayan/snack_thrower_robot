@@ -1,131 +1,213 @@
 #!/usr/bin/env python3
 """
-LeRobot Bag Picking Integration
-Uses LeRobot's framework for data collection and robot control
-with SmolVLM2 for bag detection
+Real LeRobot Hardware Integration with SmolVLM for vision-based control
+Works with actual LeRobot hardware (Koch, ALOHA, SO100, SO101, etc.)
+
+Requirements:
+- pip install lerobot
+- pip install transformers
+- pip install opencv-python pillow
+- Hardware: LeRobot-compatible robot (Koch, ALOHA, SO100, etc.)
 """
 
-import time
+import numpy as np
 import torch
 import cv2
-import numpy as np
-from pathlib import Path
 from PIL import Image
 import re
-from transformers import AutoProcessor, AutoModelForImageTextToText
+import time
+from pathlib import Path
+import json
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 # LeRobot imports
+from lerobot.common.robots import Robot, RobotConfig, make_robot_from_config
+from lerobot.common.cameras import Camera, CameraConfig, make_cameras_from_configs
+from lerobot.common.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.robots.robot import Robot
-from lerobot.common.robots.utils import get_arm_id  # Need to verify this exists
-from lerobot.common.cameras.camera import Camera
+from lerobot.common.datasets.compute_stats import compute_episode_stats, aggregate_stats
 from lerobot.common.policies.factory import make_policy
-from lerobot.common.utils.utils import init_hydra_config  # Need to verify this exists
+from lerobot.common.utils.utils import init_logging
+from lerobot.common.teleoperators import Teleoperator, make_teleoperator_from_config
+from lerobot.common.teleoperators.config import TeleoperatorConfig
 
-# Configuration
-REALSENSE_INDEX = 0  # Your RealSense D455
-VLM_MODEL = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
-DATASET_NAME = "bag_pick_demonstrations"
-FPS = 30
+# Vision model imports
+try:
+    from transformers import AutoProcessor, AutoModelForImageTextToText
+except ImportError:
+    try:
+        from transformers import AutoProcessor, AutoModelForVision2Seq as AutoModelForImageTextToText
+    except ImportError:
+        from transformers import AutoProcessor, VisionEncoderDecoderModel as AutoModelForImageTextToText
+        print("Using VisionEncoderDecoderModel as fallback")
 
-class LeRobotBagPicker:
-    """Bag picking system using LeRobot framework"""
+print("Loading LeRobot Hardware Interface with SmolVLM...")
+
+class LeRobotHardwareWithVision:
+    """Real LeRobot hardware interface with SmolVLM vision"""
     
-    def __init__(self, robot_type="xarm", use_vlm=True, record_data=True):
+    def __init__(self, robot_type="koch", teleop_type=None, calibration_path=None):
+        """
+        Initialize robot hardware and vision system
+        
+        Args:
+            robot_type: Type of robot ('koch', 'aloha', 'so100', 'so101')
+            teleop_type: Type of teleoperator (e.g., 'so100_leader', 'koch_leader')
+            calibration_path: Path to calibration directory
+        """
         self.robot_type = robot_type
-        self.use_vlm = use_vlm
-        self.record_data = record_data
-        self.episode_index = 0
         
-        # Initialize robot using LeRobot's robot factory
-        print("Initializing robot...")
-        self.robot = self._init_robot()
+        # Initialize logging
+        init_logging()
         
-        # Initialize camera using LeRobot's camera system
-        print("Initializing camera...")
-        self.camera = self._init_camera()
+        # Create robot configuration
+        print(f"Initializing {robot_type} robot hardware...")
         
-        # Initialize VLM for detection
-        if self.use_vlm:
-            print("Loading SmolVLM2...")
-            self.processor = AutoProcessor.from_pretrained(VLM_MODEL)
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                VLM_MODEL,
+        # Build robot config based on type
+        robot_config = RobotConfig(
+            robot_type=robot_type,
+            calibration_path=calibration_path or f".cache/calibration/{robot_type}"
+        )
+        
+        # Create robot instance
+        try:
+            self.robot = make_robot_from_config(robot_config)
+            self.robot.connect()
+            print(f"Robot connected successfully!")
+            print(f"Observation features: {self.robot.observation_features}")
+            print(f"Action features: {self.robot.action_features}")
+            
+        except Exception as e:
+            print(f"Failed to initialize robot hardware: {e}")
+            print("\nMake sure:")
+            print("1. Robot is connected and powered on")
+            print("2. You have the correct permissions (may need sudo)")
+            print("3. Motors are properly configured (run: python -m lerobot.setup_motors)")
+            raise
+        
+        # Initialize teleoperator if specified
+        self.teleop = None
+        if teleop_type:
+            try:
+                print(f"\nInitializing {teleop_type} teleoperator...")
+                teleop_config = TeleoperatorConfig(
+                    type=teleop_type,
+                    calibration_path=calibration_path or f".cache/calibration/{teleop_type}"
+                )
+                self.teleop = make_teleoperator_from_config(teleop_config)
+                self.teleop.connect()
+                print("Teleoperator connected!")
+            except Exception as e:
+                print(f"Warning: Could not initialize teleoperator: {e}")
+                self.teleop = None
+        
+        # Initialize cameras
+        print("\nInitializing cameras...")
+        self.cameras = {}
+        try:
+            # Get camera indices based on robot type
+            camera_indices = self.get_camera_indices()
+            
+            # Create camera configs
+            camera_configs = {}
+            for cam_name, cam_idx in camera_indices.items():
+                camera_configs[cam_name] = OpenCVCameraConfig(
+                    camera_index=cam_idx,
+                    fps=30,
+                    width=640,
+                    height=480,
+                    color_mode="rgb"
+                )
+            
+            # Create cameras from configs
+            self.cameras = make_cameras_from_configs(camera_configs)
+            
+            # Start cameras
+            for camera in self.cameras.values():
+                camera.start()
+                
+            print(f"Cameras initialized: {list(self.cameras.keys())}")
+        except Exception as e:
+            print(f"Warning: Could not initialize cameras: {e}")
+            self.cameras = {}
+        
+        # Load SmolVLM
+        print("\nLoading SmolVLM2...")
+        try:
+            self.processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
+            self.vlm = AutoModelForImageTextToText.from_pretrained(
+                "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
                 torch_dtype=torch.float32,
                 trust_remote_code=True
             ).to("cpu")
-            self.model.eval()
+            self.vlm.eval()
+            print("SmolVLM loaded!")
+        except Exception as e:
+            print(f"Error loading SmolVLM: {e}")
+            print("Continuing without vision model...")
+            self.processor = None
+            self.vlm = None
         
-        # Initialize dataset for recording
-        if self.record_data:
-            self.dataset = self._init_dataset()
-        
-        # State tracking
+        # Dataset for recording
+        self.dataset = None
         self.current_episode = []
-        self.success_count = 0
-        self.total_attempts = 0
         
-    def _init_robot(self):
-        """Initialize robot using LeRobot's configuration"""
-        if self.robot_type == "xarm":
-            # Custom xArm configuration for LeRobot
-            from lerobot.configs.robot.xarm import XArmConfig
-            robot_cfg = XArmConfig()
-            robot_cfg.ip = "192.168.1.100"  # Update with your IP
-            return Robot(robot_cfg)
+    def get_camera_indices(self):
+        """Get camera indices based on robot type"""
+        if self.robot_type == "koch":
+            return {"top": 0}  # Single camera for Koch
+        elif self.robot_type == "aloha":
+            return {"top": 0, "left_wrist": 1, "right_wrist": 2}
+        elif self.robot_type in ["so100", "so101"]:
+            return {"front": 0}
         else:
-            # Use LeRobot's default robot initialization
-            robot_cfg = init_hydra_config(f"lerobot/configs/robot/{self.robot_type}.yaml")
-            return Robot(**robot_cfg)
+            return {"top": 0}
     
-    def _init_camera(self):
-        """Initialize camera using LeRobot's camera system"""
-        # Try to use LeRobot's camera wrapper
+    def calibrate_robot(self):
+        """Run robot calibration procedure"""
+        print("\nStarting robot calibration...")
+        print("This will move the robot to find joint limits")
+        print("Make sure the area is clear!")
+        
+        input("Press Enter to start calibration...")
+        
         try:
-            from lerobot.common.cameras.opencv import OpenCVCamera
-            camera = OpenCVCamera(camera_index=REALSENSE_INDEX)
-            camera.fps = FPS
-            return camera
-        except:
-            # Fallback to basic OpenCV
-            class SimpleCamera:
-                def __init__(self, index):
-                    self.cap = cv2.VideoCapture(index)
-                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                    self.fps = FPS
-                
-                def get_frame(self):
-                    ret, frame = self.cap.read()
-                    return frame if ret else None
+            # Calibrate the robot
+            self.robot.calibrate()
+            print("Calibration complete!")
             
-            return SimpleCamera(REALSENSE_INDEX)
+            # The calibration is automatically saved by the robot
+            print(f"Calibration saved")
+            
+        except Exception as e:
+            print(f"Calibration failed: {e}")
+            raise
     
-    def _init_dataset(self):
-        """Initialize LeRobot dataset for recording demonstrations"""
-        dataset_path = Path(f"data/{DATASET_NAME}")
+    def detect_objects(self, image):
+        """Use SmolVLM to detect objects and plan actions"""
+        if self.vlm is None:
+            return {'objects': [], 'targets': [], 'actions': []}
+            
+        # Convert to PIL
+        if isinstance(image, np.ndarray):
+            pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        else:
+            pil_img = image
         
-        # Create dataset with LeRobot format
-        dataset = create_lerobot_dataset(
-            repo_id=DATASET_NAME,
-            fps=FPS,
-            robot_type=self.robot_type,
-            camera_names=["realsense"],
-            root=dataset_path,
-            force_override=False
-        )
-        
-        return dataset
-    
-    def detect_bag(self, frame):
-        """Detect bag using SmolVLM2"""
-        if not self.use_vlm:
-            # Simple color detection fallback
-            return self._detect_by_color(frame)
-        
-        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
-        prompt = "Find the bag on the table and return only its center coordinates as 'x,y'. If no bag visible, return '-1,-1'."
+        # Task-specific prompts
+        if self.robot_type == "koch":
+            prompt = """Analyze this robot workspace. I have a Koch robot arm.
+            Identify:
+            1. Any graspable objects (blocks, cups, toys)
+            2. Target locations (plates, containers, goals)
+            3. The robot gripper position
+            4. Suggested action: 'move_to: x,y', 'grasp', 'release', or 'home'
+            Return coordinates and action."""
+        else:
+            prompt = """Analyze this robot workspace. 
+            Identify objects, targets, and robot position.
+            Suggest next action with coordinates."""
         
         messages = [{
             "role": "user",
@@ -137,298 +219,400 @@ class LeRobotBagPicker:
         
         try:
             prompt_text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
-            inputs = self.processor(text=prompt_text, images=[img], return_tensors="pt")
+            inputs = self.processor(text=prompt_text, images=[pil_img], return_tensors="pt")
             
             with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, do_sample=False, max_new_tokens=20)
+                generated_ids = self.vlm.generate(**inputs, do_sample=False, max_new_tokens=150)
             
             response = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            print(f"Vision: {response}")
             
-            match = re.search(r'(\d+)\s*,\s*(\d+)', response)
-            if match:
-                x, y = int(match.group(1)), int(match.group(2))
-                return x, y
+            # Parse response
+            detections = {
+                'objects': [],
+                'targets': [],
+                'actions': []
+            }
+            
+            # Extract positions
+            object_matches = re.findall(r'object:\s*(\d+),\s*(\d+)', response)
+            for x, y in object_matches:
+                detections['objects'].append((int(x), int(y)))
+            
+            target_matches = re.findall(r'target:\s*(\d+),\s*(\d+)', response)
+            for x, y in target_matches:
+                detections['targets'].append((int(x), int(y)))
+            
+            # Extract actions
+            if 'grasp' in response.lower():
+                detections['actions'].append('grasp')
+            elif 'release' in response.lower():
+                detections['actions'].append('release')
+            elif 'move_to' in response.lower():
+                move_matches = re.findall(r'move_to:\s*(\d+),\s*(\d+)', response)
+                if move_matches:
+                    detections['actions'].append(('move_to', int(move_matches[0][0]), int(move_matches[0][1])))
+            
+            return detections
+            
         except Exception as e:
-            print(f"Detection error: {e}")
-        
-        return None, None
+            print(f"Vision error: {e}")
+            return {'objects': [], 'targets': [], 'actions': []}
     
-    def _detect_by_color(self, frame):
-        """Fast color-based detection fallback"""
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    def vision_to_joint_action(self, detections, current_obs):
+        """Convert vision detections to joint actions"""
+        # Build action dict matching robot's action features
+        action = {}
         
-        # Define color range for bags (adjust based on your bags)
-        lower = np.array([0, 50, 50])
-        upper = np.array([180, 255, 255])
+        # Get action names from robot
+        action_names = list(self.robot.action_features.keys())
         
-        mask = cv2.inRange(hsv, lower, upper)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Initialize all actions to zero
+        for name in action_names:
+            action[name] = 0.0
         
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            M = cv2.moments(largest)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                return cx, cy
-        
-        return None, None
-    
-    def pixel_to_robot_coords(self, px, py, frame_shape):
-        """Convert pixel to robot coordinates"""
-        h, w = frame_shape[:2]
-        
-        # Simple linear mapping (calibrate for your setup!)
-        # These values need calibration for your specific setup
-        WORKSPACE_WIDTH = 600  # mm
-        WORKSPACE_DEPTH = 400  # mm
-        CAMERA_OFFSET_X = 0    # mm
-        CAMERA_OFFSET_Y = 300  # mm
-        
-        # Normalize pixel coordinates
-        norm_x = (px - w/2) / (w/2)
-        norm_y = (py - h/2) / (h/2)
-        
-        # Convert to robot coordinates
-        robot_x = norm_x * (WORKSPACE_WIDTH/2) + CAMERA_OFFSET_X
-        robot_y = -norm_y * (WORKSPACE_DEPTH/2) + CAMERA_OFFSET_Y
-        
-        return robot_x, robot_y
-    
-    def execute_pick_sequence(self, target_x, target_y):
-        """Execute pick sequence and record data"""
-        print(f"Executing pick at ({target_x:.1f}, {target_y:.1f})mm")
-        
-        # Define waypoints
-        waypoints = [
-            # Current position
-            self.robot.get_state(),
-            # Pre-grasp position
-            {"x": target_x, "y": target_y, "z": 200, "gripper": 1.0},
-            # Grasp position
-            {"x": target_x, "y": target_y, "z": 50, "gripper": 1.0},
-            # Close gripper
-            {"x": target_x, "y": target_y, "z": 50, "gripper": 0.0},
-            # Lift
-            {"x": target_x, "y": target_y, "z": 200, "gripper": 0.0},
-            # Move to drop zone
-            {"x": -200, "y": 200, "z": 200, "gripper": 0.0},
-            # Open gripper
-            {"x": -200, "y": 200, "z": 200, "gripper": 1.0},
-        ]
-        
-        # Execute trajectory
-        episode_data = []
-        start_time = time.time()
-        
-        for i, waypoint in enumerate(waypoints):
-            # Move robot
-            if self.robot_type == "xarm":
-                # Custom xArm control
-                self.robot.arm.set_position(
-                    x=waypoint["x"], 
-                    y=waypoint["y"], 
-                    z=waypoint["z"],
-                    wait=True
-                )
-                self.robot.arm.set_gripper_position(
-                    waypoint["gripper"] * 800,  # Convert to xArm scale
-                    wait=True
-                )
-            else:
-                # LeRobot standard control
-                self.robot.move_to(waypoint)
+        if detections['actions']:
+            action_info = detections['actions'][0]
             
-            # Record data if enabled
-            if self.record_data:
-                frame = self.camera.get_frame()
-                robot_state = self.robot.get_state()
+            # Simple action mapping - customize based on your robot
+            if action_info == 'grasp':
+                # Close gripper - usually last action
+                if 'gripper' in action_names:
+                    action['gripper'] = -1.0
+                elif len(action_names) > 0:
+                    action[action_names[-1]] = -1.0
+                    
+            elif action_info == 'release':
+                # Open gripper
+                if 'gripper' in action_names:
+                    action['gripper'] = 1.0
+                elif len(action_names) > 0:
+                    action[action_names[-1]] = 1.0
+                    
+            elif isinstance(action_info, tuple) and action_info[0] == 'move_to':
+                # Convert pixel coordinates to joint movements
+                _, target_x, target_y = action_info
                 
-                data_point = {
-                    "timestamp": time.time() - start_time,
-                    "image": frame,
-                    "robot_state": robot_state,
-                    "action": waypoint,
-                    "step": i,
-                }
-                episode_data.append(data_point)
+                # Simple proportional control (needs proper kinematics)
+                if len(action_names) >= 3:
+                    action[action_names[0]] = (target_x - 320) / 320 * 0.1
+                    action[action_names[1]] = (240 - target_y) / 240 * 0.1
+                    action[action_names[2]] = -0.05
         
-        return episode_data
+        return action
     
-    def record_episode(self, episode_data, success):
-        """Record episode to LeRobot dataset"""
-        if not self.record_data or not episode_data:
-            return
-        
-        print(f"Recording episode {self.episode_index} (success: {success})")
-        
-        # Add episode to dataset
-        for i, data in enumerate(episode_data):
-            add_frame(
-                dataset=self.dataset,
-                episode_index=self.episode_index,
-                frame_index=i,
-                image=data["image"],
-                state=data["robot_state"],
-                action=data["action"],
-                success=success
-            )
-        
-        # Save dataset
-        self.dataset.save_episode(self.episode_index)
-        self.episode_index += 1
-    
-    def autonomous_mode(self, num_episodes=10):
-        """Run autonomous bag picking with data collection"""
-        print(f"\nStarting autonomous mode for {num_episodes} episodes")
-        print("=" * 50)
-        
-        for episode in range(num_episodes):
-            print(f"\nEpisode {episode + 1}/{num_episodes}")
+    def teleop_mode(self):
+        """Teleoperation mode - control follower with leader arms"""
+        if self.teleop is None:
+            print("No teleoperator configured!")
+            return []
             
-            # Reset robot to home
-            print("Moving to home position...")
-            if self.robot_type == "xarm":
-                self.robot.arm.set_position(x=0, y=300, z=300, wait=True)
-            else:
-                self.robot.reset()
-            
-            # Get camera frame
-            frame = self.camera.get_frame()
-            if frame is None:
-                print("Failed to get camera frame")
-                continue
-            
-            # Detect bag
-            print("Detecting bag...")
-            px, py = self.detect_bag(frame)
-            
-            if px is None:
-                print("No bag detected")
-                continue
-            
-            # Convert to robot coordinates
-            robot_x, robot_y = self.pixel_to_robot_coords(px, py, frame.shape)
-            print(f"Bag at pixel ({px}, {py}) -> robot ({robot_x:.1f}, {robot_y:.1f})mm")
-            
-            # Execute pick
-            try:
-                episode_data = self.execute_pick_sequence(robot_x, robot_y)
-                success = True
-                self.success_count += 1
-            except Exception as e:
-                print(f"Pick failed: {e}")
-                success = False
-                episode_data = []
-            
-            self.total_attempts += 1
-            
-            # Record episode
-            self.record_episode(episode_data, success)
-            
-            # Print statistics
-            success_rate = self.success_count / self.total_attempts * 100
-            print(f"Success rate: {self.success_count}/{self.total_attempts} ({success_rate:.1f}%)")
-            
-            # Wait before next episode
-            time.sleep(2)
-        
-        print("\n" + "=" * 50)
-        print(f"Completed {num_episodes} episodes")
-        print(f"Final success rate: {self.success_count}/{self.total_attempts} ({success_rate:.1f}%)")
-        
-        if self.record_data:
-            print(f"Dataset saved to: {self.dataset.root}")
-    
-    def teleoperation_mode(self):
-        """Manual control with data recording"""
         print("\nTeleoperation Mode")
-        print("=" * 50)
-        print("Controls:")
-        print("  SPACE - Detect and pick")
-        print("  'r' - Reset to home")
-        print("  's' - Start/stop recording")
-        print("  'q' - Quit")
+        print("Move the leader arm to control the follower arm")
+        print("Press 'q' to quit, 'r' to record episode")
         
         recording = False
         episode_data = []
+        fps = 30
         
-        cv2.namedWindow("LeRobot Bag Picker", cv2.WINDOW_AUTOSIZE)
+        try:
+            while True:
+                loop_start = time.perf_counter()
+                
+                # Get observation from robot
+                observation = self.robot.get_observation()
+                
+                # Get action from teleoperator
+                action = self.teleop.get_action()
+                
+                # Send action to robot
+                sent_action = self.robot.send_action(action)
+                
+                # Show camera feed
+                for cam_name, camera in self.cameras.items():
+                    frame = camera.read()
+                    if frame is not None and cam_name == "top" or cam_name == "front":
+                        cv2.imshow(f'Camera: {cam_name}', frame)
+                
+                # Record if enabled
+                if recording:
+                    # Combine observation with camera images
+                    full_obs = observation.copy()
+                    for cam_name, camera in self.cameras.items():
+                        frame = camera.read()
+                        if frame is not None:
+                            full_obs[f"observation.images.{cam_name}"] = frame
+                    
+                    episode_data.append({
+                        'observation': full_obs,
+                        'action': sent_action,
+                        'timestamp': time.time()
+                    })
+                
+                # Handle keyboard
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('r'):
+                    recording = not recording
+                    if recording:
+                        print("Recording started...")
+                        episode_data = []
+                    else:
+                        print(f"Recording stopped. {len(episode_data)} frames captured.")
+                
+                # Maintain FPS
+                dt_s = time.perf_counter() - loop_start
+                if dt_s < 1/fps:
+                    time.sleep(1/fps - dt_s)
+                    
+        except KeyboardInterrupt:
+            print("\nTeleoperation stopped.")
+        finally:
+            cv2.destroyAllWindows()
+            
+        return episode_data
+    
+    def autonomous_mode(self):
+        """Autonomous mode with vision guidance"""
+        print("\nAutonomous Mode with Vision")
+        print("Robot will use vision to perform tasks")
+        print("Press 'q' to quit, 'space' to pause")
+        
+        paused = False
+        fps = 30
+        
+        try:
+            while True:
+                loop_start = time.perf_counter()
+                
+                if not paused:
+                    # Get observation
+                    observation = self.robot.get_observation()
+                    
+                    # Get camera image
+                    cam_name = list(self.cameras.keys())[0] if self.cameras else None
+                    if cam_name:
+                        frame = self.cameras[cam_name].read()
+                        if frame is not None:
+                            # Show frame
+                            cv2.imshow('Robot Vision', frame)
+                            
+                            # Get vision detections
+                            detections = self.detect_objects(frame)
+                            
+                            # Compute action
+                            action = self.vision_to_joint_action(detections, observation)
+                            
+                            # Apply safety limits
+                            for key in action:
+                                action[key] = np.clip(action[key], -0.1, 0.1)
+                            
+                            # Send action
+                            self.robot.send_action(action)
+                
+                # Handle keyboard
+                key = cv2.waitKey(50) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord(' '):
+                    paused = not paused
+                    print(f"{'Paused' if paused else 'Resumed'}")
+                
+                # Maintain FPS
+                dt_s = time.perf_counter() - loop_start
+                if dt_s < 1/fps:
+                    time.sleep(1/fps - dt_s)
+                    
+        except KeyboardInterrupt:
+            print("\nAutonomous mode stopped.")
+        finally:
+            cv2.destroyAllWindows()
+    
+    def collect_dataset(self, task_name="pick_place", num_episodes=10):
+        """Collect a dataset for training"""
+        print(f"\nCollecting dataset: {task_name}")
+        print(f"Target: {num_episodes} episodes")
+        
+        if self.teleop is None:
+            print("Error: No teleoperator configured for data collection!")
+            return None
+        
+        # Create dataset
+        repo_id = f"lerobot_{self.robot_type}_{task_name}"
+        root_path = Path(f"data/{repo_id}")
+        root_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize dataset with proper features
+        features = {
+            **self.robot.observation_features,
+            **self.robot.action_features
+        }
+        
+        # Add camera features
+        for cam_name in self.cameras:
+            features[f"observation.images.{cam_name}"] = {"shape": (480, 640, 3), "dtype": "uint8"}
+        
+        self.dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=30,
+            root=root_path,
+            features=features,
+            force_override=True
+        )
+        
+        # Collect episodes
+        for episode in range(num_episodes):
+            print(f"\nEpisode {episode + 1}/{num_episodes}")
+            print("Demonstrate the task using teleoperation...")
+            
+            # Collect episode via teleoperation
+            episode_data = self.teleop_mode()
+            
+            if episode_data:
+                # Add episode to dataset
+                for frame in episode_data:
+                    self.dataset.add_frame({
+                        **frame['observation'],
+                        **frame['action'],
+                        'timestamp': frame['timestamp']
+                    })
+                
+                print(f"Episode {episode + 1} saved ({len(episode_data)} frames)")
+        
+        # Save dataset
+        self.dataset.save_to_disk()
+        print(f"\nDataset saved to {root_path}")
+        
+        return self.dataset
+    
+    def run_interactive(self):
+        """Run robot with interactive control"""
+        print("\nInteractive Robot Control")
+        print("="*50)
+        print("Controls:")
+        if self.teleop:
+            print("  't' - Teleoperation mode")
+        print("  'a' - Autonomous mode (vision-guided)")
+        print("  'v' - Test vision system")
+        print("  'o' - Show observation")
+        print("  'q' - Quit")
+        print("="*50)
+        
+        fps = 30
         
         while True:
-            frame = self.camera.get_frame()
-            if frame is None:
-                continue
+            loop_start = time.perf_counter()
             
-            # Display
-            display = frame.copy()
+            # Show camera feed
+            cam_name = list(self.cameras.keys())[0] if self.cameras else None
+            if cam_name:
+                frame = self.cameras[cam_name].read()
+                if frame is not None:
+                    cv2.imshow('Robot Camera', frame)
             
-            # Status
-            status = "RECORDING" if recording else "READY"
-            color = (0, 0, 255) if recording else (0, 255, 0)
-            cv2.putText(display, status, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            
-            cv2.imshow("LeRobot Bag Picker", display)
-            
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(50) & 0xFF
             
             if key == ord('q'):
                 break
+            elif key == ord('t') and self.teleop:
+                self.teleop_mode()
+            elif key == ord('a'):
+                self.autonomous_mode()
+            elif key == ord('v'):
+                # Test vision
+                if cam_name and self.vlm is not None:
+                    frame = self.cameras[cam_name].read()
+                    if frame is not None:
+                        detections = self.detect_objects(frame)
+                        print(f"Vision detections: {detections}")
+            elif key == ord('o'):
+                # Show observation
+                obs = self.robot.get_observation()
+                print(f"Current observation: {obs}")
             
-            elif key == ord(' '):
-                # Detect and pick
-                px, py = self.detect_bag(frame)
-                if px is not None:
-                    rx, ry = self.pixel_to_robot_coords(px, py, frame.shape)
-                    episode_data = self.execute_pick_sequence(rx, ry)
-                    
-                    if recording:
-                        self.record_episode(episode_data, success=True)
-                
-            elif key == ord('r'):
-                # Reset
-                if self.robot_type == "xarm":
-                    self.robot.arm.set_position(x=0, y=300, z=300, wait=True)
-                else:
-                    self.robot.reset()
-            
-            elif key == ord('s'):
-                recording = not recording
-                if recording:
-                    print("Started recording")
-                    episode_data = []
-                else:
-                    print("Stopped recording")
+            # Maintain FPS
+            dt_s = time.perf_counter() - loop_start
+            if dt_s < 1/fps:
+                time.sleep(1/fps - dt_s)
         
         cv2.destroyAllWindows()
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--robot", default="xarm", help="Robot type")
-    parser.add_argument("--mode", choices=["auto", "teleop"], default="auto", 
-                       help="Operation mode")
-    parser.add_argument("--episodes", type=int, default=10, 
-                       help="Number of episodes for auto mode")
-    parser.add_argument("--no-vlm", action="store_true", 
-                       help="Use color detection instead of VLM")
-    parser.add_argument("--no-record", action="store_true", 
-                       help="Disable data recording")
-    args = parser.parse_args()
+    print("\nLeRobot Hardware Interface")
+    print("="*50)
+    print("Available robots:", ["koch", "aloha", "so100", "so101"])
     
-    # Initialize system
-    picker = LeRobotBagPicker(
-        robot_type=args.robot,
-        use_vlm=not args.no_vlm,
-        record_data=not args.no_record
-    )
+    # Get robot type
+    robot_type = input("Enter robot type [koch]: ").strip() or "koch"
     
-    # Run selected mode
-    if args.mode == "auto":
-        picker.autonomous_mode(num_episodes=args.episodes)
-    else:
-        picker.teleoperation_mode()
+    # Check if teleoperation is desired
+    use_teleop = input("Enable teleoperation? (y/n) [n]: ").strip().lower() == 'y'
+    teleop_type = None
+    
+    if use_teleop:
+        # Map robot type to teleop type
+        teleop_map = {
+            "koch": "koch_leader",
+            "so100": "so100_leader", 
+            "so101": "so101_leader",
+            "aloha": "aloha_leader"
+        }
+        teleop_type = teleop_map.get(robot_type)
+        print(f"Will use {teleop_type} for teleoperation")
+    
+    try:
+        robot = LeRobotHardwareWithVision(
+            robot_type=robot_type,
+            teleop_type=teleop_type
+        )
+    except Exception as e:
+        print(f"\nFailed to initialize robot: {e}")
+        return
+    
+    while True:
+        print("\n" + "="*50)
+        print("LeRobot Hardware Control")
+        print("="*50)
+        print("1. Calibrate robot")
+        print("2. Interactive control")
+        print("3. Collect dataset")
+        print("4. Test robot connection")
+        print("5. Find cameras")
+        print("0. Exit")
+        
+        choice = input("\nSelect option: ").strip()
+        
+        if choice == "1":
+            robot.calibrate_robot()
+        elif choice == "2":
+            robot.run_interactive()
+        elif choice == "3":
+            task = input("Task name [pick_place]: ").strip() or "pick_place"
+            episodes = int(input("Number of episodes [5]: ").strip() or "5")
+            robot.collect_dataset(task_name=task, num_episodes=episodes)
+        elif choice == "4":
+            # Test robot
+            print("\nTesting robot connection...")
+            print(f"Connected: {robot.robot.is_connected}")
+            print(f"Calibrated: {robot.robot.is_calibrated}")
+            obs = robot.robot.get_observation()
+            print(f"Sample observation: {obs}")
+        elif choice == "5":
+            # List available cameras
+            import subprocess
+            print("\nFinding cameras...")
+            subprocess.run(["python", "-m", "lerobot.find_cameras"])
+        elif choice == "0":
+            break
+        else:
+            print("Invalid option")
+    
+    # Cleanup
+    robot.robot.disconnect()
+    if robot.teleop:
+        robot.teleop.disconnect()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
