@@ -16,12 +16,11 @@ from transformers import AutoProcessor, AutoModelForImageTextToText
 
 # LeRobot imports
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.populate_dataset import add_frame, create_lerobot_dataset
 from lerobot.common.robots.robot import Robot
-from lerobot.common.robots.utils import get_arm_id
+from lerobot.common.robots.utils import get_arm_id  # Need to verify this exists
 from lerobot.common.cameras.camera import Camera
 from lerobot.common.policies.factory import make_policy
-from lerobot.common.utils.utils import init_hydra_config
+from lerobot.common.utils.utils import init_hydra_config  # Need to verify this exists
 
 # Configuration
 REALSENSE_INDEX = 0  # Your RealSense D455
