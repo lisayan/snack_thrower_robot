@@ -55,3 +55,28 @@ pytest>=7.3.0
 imageio>=2.31.0
 imageio-ffmpeg>=0.4.8
 moviepy>=1.0.3
+# Core dependencies
+torch>=2.0.0
+transformers>=4.40.0
+accelerate>=0.27.0
+Pillow>=10.0.0
+numpy>=1.24
+opencv-python>=4.7.0.72
+
+# HuggingFace model (SmolVLM2)
+git+https://github.com/huggingface/transformers.git  # ensures latest chat template support
+
+# LeRobot (assumes it's installed locally or from a repo)
+lerobot @ git+https://github.com/lerobot/lerobot.git
+
+# Optional but recommended for CLI & YAML config
+hydra-core>=1.3
+omegaconf>=2.3
+
+# For dataset creation and management
+h5py>=3.10
+imageio>=2.31
+scikit-image>=0.21
+
+# For terminal use & argument parsing (standard in Python >=3.6, but useful to list if running in isolated envs)
+argparse
