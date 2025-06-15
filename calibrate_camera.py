@@ -180,6 +180,8 @@ class LeRobotHardwareWithVision:
                     port = input("Enter the detected port: ").strip()
             
             # Build robot config based on type
+            print(f"Creating robot configuration for {robot_type}...")
+            
             if robot_type == "koch" or robot_type == "koch_follower":
                 robot_config = KochFollowerConfig(
                     port=port,
@@ -198,16 +200,27 @@ class LeRobotHardwareWithVision:
             else:
                 raise ValueError(f"Unknown robot type: {robot_type}. Supported: koch, so100, so101")
             
+            print(f"Robot configuration created: {robot_config}")
+            
             # Create robot instance
             try:
+                print("Creating robot instance from config...")
                 self.robot = make_robot_from_config(robot_config)
+                print("Robot instance created, attempting to connect...")
+                
                 self.robot.connect()
                 print(f"Robot connected successfully!")
+                print(f"Robot is_connected: {self.robot.is_connected}")
+                print(f"Robot is_calibrated: {self.robot.is_calibrated}")
                 print(f"Observation features: {self.robot.observation_features}")
                 print(f"Action features: {self.robot.action_features}")
                 
             except Exception as e:
                 print(f"Failed to initialize robot hardware: {e}")
+                print(f"Error type: {type(e).__name__}")
+                import traceback
+                print("Full traceback:")
+                traceback.print_exc()
                 print("\nMake sure:")
                 print("1. Robot is connected and powered on")
                 print("2. You have the correct permissions (may need sudo)")
