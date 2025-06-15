@@ -22,15 +22,26 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 # LeRobot imports
-from lerobot.common.robots import Robot, RobotConfig, make_robot_from_config
+from lerobot.common.robots import Robot, make_robot_from_config
+from lerobot.common.robots.koch_follower.config_koch_follower import KochFollowerConfig
+from lerobot.common.robots.so100_follower.config_so100_follower import SO100FollowerConfig
+from lerobot.common.robots.so101_follower.config_so101_follower import SO101FollowerConfig
 from lerobot.common.cameras import Camera, CameraConfig, make_cameras_from_configs
 from lerobot.common.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.compute_stats import compute_episode_stats, aggregate_stats
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import init_logging
-from lerobot.common.teleoperators import Teleoperator, make_teleoperator_from_config
-from lerobot.common.teleoperators.config import TeleoperatorConfig
+
+# Try to import teleoperator classes if available
+try:
+    from lerobot.common.teleoperators.so100_leader.config_so100_leader import SO100LeaderConfig
+    from lerobot.common.teleoperators.so101_leader.config_so101_leader import SO101LeaderConfig
+    from lerobot.common.teleoperators.utils import make_teleoperator_from_config
+    TELEOP_AVAILABLE = True
+except ImportError:
+    print("Warning: Teleoperator modules not found. Teleoperation will be disabled.")
+    TELEOP_AVAILABLE = False
 
 # Vision model imports
 try:
@@ -64,11 +75,33 @@ class LeRobotHardwareWithVision:
         # Create robot configuration
         print(f"Initializing {robot_type} robot hardware...")
         
+        # First, find the robot port
+        port = input("Enter robot port (or press Enter to auto-detect): ").strip()
+        if not port:
+            print("Auto-detecting robot port...")
+            import subprocess
+            result = subprocess.run(["python", "-m", "lerobot.find_port"], capture_output=True, text=True)
+            print(result.stdout)
+            port = input("Enter the detected port: ").strip()
+        
         # Build robot config based on type
-        robot_config = RobotConfig(
-            robot_type=robot_type,
-            calibration_path=calibration_path or f".cache/calibration/{robot_type}"
-        )
+        if robot_type == "koch" or robot_type == "koch_follower":
+            robot_config = KochFollowerConfig(
+                port=port,
+                calibration_dir=calibration_path or f".cache/calibration/{robot_type}"
+            )
+        elif robot_type == "so100" or robot_type == "so100_follower":
+            robot_config = SO100FollowerConfig(
+                port=port,
+                calibration_dir=calibration_path or f".cache/calibration/{robot_type}"
+            )
+        elif robot_type == "so101" or robot_type == "so101_follower":
+            robot_config = SO101FollowerConfig(
+                port=port,
+                calibration_dir=calibration_path or f".cache/calibration/{robot_type}"
+            )
+        else:
+            raise ValueError(f"Unknown robot type: {robot_type}. Supported: koch, so100, so101")
         
         # Create robot instance
         try:
@@ -88,16 +121,35 @@ class LeRobotHardwareWithVision:
         
         # Initialize teleoperator if specified
         self.teleop = None
-        if teleop_type:
+        if teleop_type and TELEOP_AVAILABLE:
             try:
                 print(f"\nInitializing {teleop_type} teleoperator...")
-                teleop_config = TeleoperatorConfig(
-                    type=teleop_type,
-                    calibration_path=calibration_path or f".cache/calibration/{teleop_type}"
-                )
-                self.teleop = make_teleoperator_from_config(teleop_config)
-                self.teleop.connect()
-                print("Teleoperator connected!")
+                
+                # Get teleop port
+                teleop_port = input("Enter teleoperator port (or press Enter to skip): ").strip()
+                if not teleop_port:
+                    print("Skipping teleoperator initialization")
+                    self.teleop = None
+                else:
+                    # Create teleop config based on type
+                    if teleop_type == "so100_leader":
+                        teleop_config = SO100LeaderConfig(
+                            port=teleop_port,
+                            calibration_dir=calibration_path or f".cache/calibration/{teleop_type}"
+                        )
+                    elif teleop_type == "so101_leader":
+                        teleop_config = SO101LeaderConfig(
+                            port=teleop_port,
+                            calibration_dir=calibration_path or f".cache/calibration/{teleop_type}"
+                        )
+                    else:
+                        print(f"Unknown teleop type: {teleop_type}")
+                        self.teleop = None
+                        return
+                    
+                    self.teleop = make_teleoperator_from_config(teleop_config)
+                    self.teleop.connect()
+                    print("Teleoperator connected!")
             except Exception as e:
                 print(f"Warning: Could not initialize teleoperator: {e}")
                 self.teleop = None
@@ -541,7 +593,7 @@ class LeRobotHardwareWithVision:
 def main():
     print("\nLeRobot Hardware Interface")
     print("="*50)
-    print("Available robots:", ["koch", "aloha", "so100", "so101"])
+    print("Available robots:", ["koch", "so100", "so101"])
     
     # Get robot type
     robot_type = input("Enter robot type [koch]: ").strip() or "koch"
@@ -550,16 +602,17 @@ def main():
     use_teleop = input("Enable teleoperation? (y/n) [n]: ").strip().lower() == 'y'
     teleop_type = None
     
-    if use_teleop:
+    if use_teleop and TELEOP_AVAILABLE:
         # Map robot type to teleop type
         teleop_map = {
             "koch": "koch_leader",
             "so100": "so100_leader", 
-            "so101": "so101_leader",
-            "aloha": "aloha_leader"
+            "so101": "so101_leader"
         }
         teleop_type = teleop_map.get(robot_type)
-        print(f"Will use {teleop_type} for teleoperation")
+        if not teleop_type or teleop_type == "koch_leader":
+            print(f"Note: Teleoperation for {robot_type} may require custom setup")
+            teleop_type = None
     
     try:
         robot = LeRobotHardwareWithVision(
